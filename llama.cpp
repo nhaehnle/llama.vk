@@ -676,18 +676,6 @@ static bool llama_model_load(
                 auto tensor = model.tensors[name.data()];
 
                 if (n_dims == 1) {
-                    if (ggml_nelements(tensor) != nelements) {
-                        fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
-                        return false;
-                    }
-                } else {
-                    if (ggml_nelements(tensor)/n_parts != nelements) {
-                        fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
-                        return false;
-                    }
-                }
-
-                if (n_dims == 1) {
                     if (tensor->ne[0] != ne[0] || tensor->ne[1] != ne[1]) {
                         fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%d, %d], expected [%d, %d]\n",
                                 __func__, name.data(), tensor->ne[0], tensor->ne[1], ne[0], ne[1]);
@@ -706,6 +694,18 @@ static bool llama_model_load(
                                     __func__, name.data(), tensor->ne[0], tensor->ne[1]/n_parts, ne[0], ne[1]);
                             return false;
                         }
+                    }
+                }
+
+                if (n_dims == 1) {
+                    if (ggml_nelements(tensor) != nelements) {
+                        fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
+                        return false;
+                    }
+                } else {
+                    if (ggml_nelements(tensor)/n_parts != nelements) {
+                        fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
+                        return false;
                     }
                 }
 
