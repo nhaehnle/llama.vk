@@ -30,10 +30,18 @@ endif
 # Compile flags
 #
 
-# keep standard at C11 and C++11
-CFLAGS   = -I.              -O3 -DNDEBUG -std=c11   -fPIC
-CXXFLAGS = -I. -I./examples -O3 -DNDEBUG -std=c++11 -fPIC
+# keep standard at C11 and C++17
+CFLAGS   = -I.              -std=c11   -fPIC
+CXXFLAGS = -I. -I./examples -std=c++17 -fPIC
 LDFLAGS  =
+
+ifdef LLAMA_DEBUG
+CFLAGS   += -g -Og
+CXXFLAGS += -g -Og
+else
+CFLAGS   += -O3 -DNDEBUG
+CXXFLAGS += -O3 -DNDEBUG
+endif
 
 # OS specific
 # TODO: support Windows
@@ -212,7 +220,7 @@ $(info I CC:       $(CCV))
 $(info I CXX:      $(CXXV))
 $(info )
 
-default: main quantize perplexity
+default: main quantize perplexity llama-vk
 
 #
 # Build library
@@ -241,6 +249,9 @@ quantize: examples/quantize/quantize.cpp ggml.o llama.o
 
 perplexity: examples/perplexity/perplexity.cpp ggml.o llama.o common.o
 	$(CXX) $(CXXFLAGS) examples/perplexity/perplexity.cpp ggml.o llama.o common.o -o perplexity $(LDFLAGS)
+
+llama-vk: llama-vk.cpp
+	$(CXX) $(CXXFLAGS) llama-vk.cpp -lvulkan -o llama-vk
 
 #
 # Tests
