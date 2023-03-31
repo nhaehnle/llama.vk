@@ -24,11 +24,12 @@ static VkResult llvk_check_result(VkResult result, const char *call, const char 
 namespace llvk {
 
 class Instance {
-    VkInstance theInstance;
+protected:
+    VkInstance theInstance = nullptr;
 
 public:
-    Instance();
-    ~Instance();
+    Instance() = default;
+    explicit Instance(VkInstance instance);
 
     operator VkInstance() { return theInstance; }
 
@@ -36,7 +37,39 @@ public:
 #include "llama-vk-functions.inc"
 };
 
-Instance::Instance() {
+class OwnedInstance : public Instance {
+public:
+    OwnedInstance() = default;
+    ~OwnedInstance();
+
+    explicit OwnedInstance(VkInstance instance) : Instance(instance) {}
+
+    OwnedInstance(OwnedInstance &&rhs) : Instance(rhs) {
+        rhs.theInstance = nullptr;
+    }
+    OwnedInstance &operator=(OwnedInstance &&rhs) {
+        if (&rhs != this) {
+            if (theInstance)
+                DestroyInstance(theInstance, NULL);
+            this->Instance::operator=(rhs);
+            rhs.theInstance = nullptr;
+        }
+        return *this;
+    }
+
+    static OwnedInstance createDefault();
+
+private:
+    OwnedInstance(const OwnedInstance &rhs) = delete;
+    OwnedInstance &operator=(const OwnedInstance &rhs) = delete;
+};
+
+Instance::Instance(VkInstance instance) : theInstance(instance) {
+#define FN(name) name = reinterpret_cast<PFN_vk ## name>(vkGetInstanceProcAddr(theInstance, "vk" # name));
+#include "llama-vk-functions.inc"
+}
+
+OwnedInstance OwnedInstance::createDefault() {
     PFN_vkEnumerateInstanceLayerProperties EnumerateInstanceLayerProperties = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceLayerProperties"));
     PFN_vkCreateInstance CreateInstance = reinterpret_cast<PFN_vkCreateInstance>(vkGetInstanceProcAddr(NULL, "vkCreateInstance"));
 
@@ -92,14 +125,14 @@ Instance::Instance() {
     createInfo.enabledExtensionCount = instanceExtensions.size();
     createInfo.ppEnabledExtensionNames = instanceExtensions.data();
 
-    LLVK_CHECK_RESULT(CreateInstance(&createInfo, NULL, &theInstance));
-
-#define FN(name) name = reinterpret_cast<PFN_vk ## name>(vkGetInstanceProcAddr(theInstance, "vk" # name));
-#include "llama-vk-functions.inc"
+    VkInstance instance;
+    LLVK_CHECK_RESULT(CreateInstance(&createInfo, NULL, &instance));
+    return OwnedInstance(instance);
 }
 
-Instance::~Instance() {
-    DestroyInstance(*this, NULL);
+OwnedInstance::~OwnedInstance() {
+    if (theInstance)
+        DestroyInstance(theInstance, NULL);
 }
 
 } // namespace llvk
@@ -116,7 +149,7 @@ static unsigned deviceTypePriority(VkPhysicalDeviceType type) {
 }
 
 int main(int argc, char **argv) {
-    llvk::Instance vk;
+    auto vk = llvk::OwnedInstance::createDefault();
 
     uint32_t physicalDeviceCount;
     std::vector<VkPhysicalDevice> physicalDevices;
