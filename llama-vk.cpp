@@ -135,7 +135,50 @@ OwnedInstance::~OwnedInstance() {
         DestroyInstance(theInstance, NULL);
 }
 
-} // namespace llvk
+class Device {
+protected:
+    Instance *vk = nullptr;
+    VkDevice device = nullptr;
+    VkQueue computeQueue = nullptr;
+    VkQueue transferQueue = nullptr;
+
+    Device() = default;
+
+public:
+    Device(Instance &vk, VkDevice device, VkQueue computeQueue, VkQueue transferQueue)
+        : vk(&vk), device(device), computeQueue(computeQueue)
+        , transferQueue(transferQueue) {}
+
+};
+
+class OwnedDevice : public Device {
+public:
+    OwnedDevice() = default;
+    ~OwnedDevice() {
+        if (device)
+            vk->DestroyDevice(device, NULL);
+    }
+
+    OwnedDevice(OwnedDevice &&rhs) : Device(rhs) {
+        rhs.device = nullptr;
+    }
+    OwnedDevice &operator=(OwnedDevice &&rhs) {
+        if (&rhs != this) {
+            if (device)
+                vk->DestroyDevice(device, NULL);
+            this->Device::operator=(rhs);
+            rhs.device = nullptr;
+        }
+        return *this;
+    }
+
+    static OwnedDevice createDefault(Instance &vk);
+
+private:
+    OwnedDevice(const OwnedDevice &rhs) = delete;
+    OwnedDevice &operator=(const OwnedDevice &rhs) = delete;
+
+};
 
 static unsigned deviceTypePriority(VkPhysicalDeviceType type) {
     switch (type) {
@@ -148,9 +191,7 @@ static unsigned deviceTypePriority(VkPhysicalDeviceType type) {
     }
 }
 
-int main(int argc, char **argv) {
-    auto vk = llvk::OwnedInstance::createDefault();
-
+OwnedDevice OwnedDevice::createDefault(Instance &vk) {
     uint32_t physicalDeviceCount;
     std::vector<VkPhysicalDevice> physicalDevices;
     LLVK_CHECK_RESULT(vk.EnumeratePhysicalDevices(vk, &physicalDeviceCount, NULL));
@@ -321,10 +362,28 @@ int main(int argc, char **argv) {
     createInfo.queueCreateInfoCount = queueCreateInfos.size();
     createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
-    VkDevice device;
-    LLVK_CHECK_RESULT(vk.CreateDevice(physicalDevice, &createInfo, NULL, &device));
+    OwnedDevice ownedDevice;
+    ownedDevice.vk = &vk;
+    LLVK_CHECK_RESULT(vk.CreateDevice(physicalDevice, &createInfo, NULL,
+                                      &ownedDevice.device));
 
-    vk.DestroyDevice(device, NULL);
+    vk.GetDeviceQueue(ownedDevice.device, computeQueueFamily, 0, &ownedDevice.computeQueue);
+    if (transferQueueFamily >= 0) {
+        unsigned index = computeQueueFamily == transferQueueFamily ? 1 : 0;
+        vk.GetDeviceQueue(ownedDevice.device, transferQueueFamily, index,
+                          &ownedDevice.transferQueue);
+    }
+
+    return std::move(ownedDevice);
+}
+
+} // namespace llvk
+
+int main(int argc, char **argv) {
+    auto vk = llvk::OwnedInstance::createDefault();
+
+    auto device = llvk::OwnedDevice::createDefault(vk);
+
 
     printf("Hi rebuild\n");
     return 0;
