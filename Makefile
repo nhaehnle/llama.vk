@@ -250,8 +250,8 @@ quantize: examples/quantize/quantize.cpp ggml.o llama.o
 perplexity: examples/perplexity/perplexity.cpp ggml.o llama.o common.o
 	$(CXX) $(CXXFLAGS) examples/perplexity/perplexity.cpp ggml.o llama.o common.o -o perplexity $(LDFLAGS)
 
-llama-vk: llama-vk.cpp
-	$(CXX) $(CXXFLAGS) llama-vk.cpp -lvulkan -o llama-vk
+llama-vk: vulkan/llama-vk.cpp
+	$(CXX) $(CXXFLAGS) vulkan/llama-vk.cpp -lvulkan -o llama-vk
 
 #
 # Tests
