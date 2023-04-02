@@ -296,7 +296,8 @@ static bool llama_model_load(
         ggml_type memory_type,
         bool vocab_only,
         llama_progress_callback progress_callback,
-        void *progress_callback_user_data) {
+        void *progress_callback_user_data,
+        llama_file_info *file_info) {
     fprintf(stderr, "%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
 
     const int64_t t_start_us = ggml_time_us();
@@ -368,6 +369,14 @@ static bool llama_model_load(
             fprintf(stderr, "%s: use '--n_parts 1' if necessary\n", __func__);
         }
 
+        if (file_info) {
+            file_info->n_vocab = hparams.n_vocab;
+            file_info->n_parts = n_parts;
+            file_info->n_embd = hparams.n_embd;
+            file_info->n_ff = n_ff;
+            file_info->n_layer = hparams.n_layer;
+        }
+
         if (hparams.n_layer == 32) {
             model.type = e_model::MODEL_7B;
         }
@@ -426,6 +435,12 @@ static bool llama_model_load(
             tok_score.score = score;
         }
     }
+
+    const size_t file_offset = fin.tellg();
+    fin.close();
+
+    if (file_info)
+        file_info->tensors_offset = file_offset;
 
     if (vocab_only) {
         return true;
@@ -575,10 +590,6 @@ static bool llama_model_load(
             model.tensors["layers." + std::to_string(i) + ".feed_forward.w3.weight"] = layer.w3;
         }
     }
-
-    const size_t file_offset = fin.tellg();
-
-    fin.close();
 
     std::vector<uint8_t> tmp;
 
@@ -1631,7 +1642,8 @@ bool llama_model_quantize_internal(const std::string & fname_inp, const std::str
 
 struct llama_context * llama_init_from_file(
                              const char * path_model,
-            struct llama_context_params   params) {
+            struct llama_context_params   params,
+                 struct llama_file_info * file_info) {
     ggml_time_init();
 
     llama_context * ctx = new llama_context;
@@ -1647,7 +1659,7 @@ struct llama_context * llama_init_from_file(
 
     if (!llama_model_load(path_model, *ctx, params.n_ctx, params.n_parts, memory_type,
                           params.vocab_only, params.progress_callback,
-                          params.progress_callback_user_data)) {
+                          params.progress_callback_user_data, file_info)) {
         fprintf(stderr, "%s: failed to load model\n", __func__);
         llama_free(ctx);
         return nullptr;
@@ -1664,7 +1676,7 @@ struct llama_context * llama_init_from_file(
     }
 
     // reserve memory for context buffers
-    {
+    if (!params.vocab_only) {
         if (!kv_cache_init(ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx)) {
             fprintf(stderr, "%s: kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);

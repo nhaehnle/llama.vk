@@ -66,12 +66,23 @@ extern "C" {
 
     LLAMA_API struct llama_context_params llama_context_default_params();
 
+    struct llama_file_info {
+        int n_vocab;
+        int n_parts;
+        int n_embd;
+        int n_ff;
+        int n_layer;
+        size_t tensors_offset;
+    };
+
     // Various functions for loading a ggml llama model.
     // Allocate (almost) all memory needed for the model.
+    // Optionally report information about the file in file_info.
     // Return NULL on failure
     LLAMA_API struct llama_context * llama_init_from_file(
                              const char * path_model,
-            struct llama_context_params   params);
+            struct llama_context_params   params,
+                 struct llama_file_info * file_info);
 
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
