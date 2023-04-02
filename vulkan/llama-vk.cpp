@@ -1,6 +1,7 @@
 
 #include <array>
 #include <cassert>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,9 @@
 #include "../llama.h"
 
 #include "vulkan/vulkan.h"
+
+#define LLAMA_HOST
+#include "llama-vk-shader.h"
 
 #define LLVK_CHECK_RESULT(result) llvk_check_result(result, #result, __FILE__, __LINE__)
 
@@ -24,6 +28,28 @@ static VkResult llvk_check_result(VkResult result, const char *call, const char 
     }
 
     return result;
+}
+
+template <typename T, typename U>
+static T alignPot(T x, U to) {
+    return (x + T(to - 1)) & ~T(to - 1);
+}
+
+static std::string formatNumBytes(uint64_t numBytes) {
+    static const char *units[] = {
+        "B", "kiB", "MiB", "GiB", "TiB", nullptr,
+    };
+    uint64_t quantity = numBytes;
+    unsigned unit = 0;
+
+    while (units[unit + 1] && quantity >= 4 * 1024) {
+        quantity = (quantity + 1024 - 1) / 1024;
+        ++unit;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f%s", (float)quantity, units[unit]);
+    return buf;
 }
 
 namespace llvk {
@@ -146,6 +172,9 @@ protected:
     VkDevice device = nullptr;
     VkQueue computeQueue = nullptr;
     VkQueue transferQueue = nullptr;
+    VkPhysicalDeviceMemoryProperties m_memoryProperties;
+    int m_deviceMemType = -1;
+    int m_hostMemType = -1;
 
     Device() = default;
 
@@ -154,8 +183,99 @@ public:
         : vk(&vk), device(device), computeQueue(computeQueue)
         , transferQueue(transferQueue) {}
 
+    void init(VkPhysicalDevice physicalDevice);
+
     operator VkDevice() { return device; }
+
+    VkDeviceMemory allocateDevice(uint64_t numBytes) { return allocate(m_deviceMemType, numBytes); }
+    VkDeviceMemory allocateHost(uint64_t numBytes) { return allocate(m_hostMemType, numBytes); }
+
+    void free(VkDeviceMemory memory);
+
+private:
+    VkDeviceMemory allocate(int memType, uint64_t numBytes);
 };
+
+void Device::init(VkPhysicalDevice physicalDevice) {
+    vk->GetPhysicalDeviceMemoryProperties(physicalDevice, &m_memoryProperties);
+
+    int bestDeviceMemType = -1;
+    uint64_t bestDeviceHeapSize = 0;
+    int bestHostMemType = -1;
+    uint64_t bestHostHeapSize = 0;
+    bool bestHostIsLocal = false;
+
+    for (unsigned i = 0; i < m_memoryProperties.memoryTypeCount; ++i) {
+        const VkMemoryType &type = m_memoryProperties.memoryTypes[i];
+        const VkMemoryHeap &heap = m_memoryProperties.memoryHeaps[type.heapIndex];
+
+        if (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            if (bestDeviceMemType < 0 || heap.size > bestDeviceHeapSize) {
+                bestDeviceMemType = i;
+                bestDeviceHeapSize = heap.size;
+            }
+        }
+
+        if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+        {
+            bool isLocal = !(type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (bestHostMemType < 0 ||
+                (isLocal && !bestHostIsLocal) ||
+                (isLocal == bestHostIsLocal && heap.size > bestHostHeapSize))
+            {
+                bestHostMemType = i;
+                bestHostHeapSize = heap.size;
+                bestHostIsLocal = isLocal;
+            }
+        }
+    }
+
+    if (bestDeviceMemType < 0) {
+        fprintf(stderr, "%s: no suitable GPU memory found\n", __func__);
+        exit(1);
+    }
+
+    if (bestHostMemType < 0) {
+        fprintf(stderr, "%s: no suitable CPU memory found\n", __func__);
+        exit(1);
+    }
+
+    printf("vulkan: using GPU memory type %u and CPU memory type %u\n",
+            bestDeviceMemType, bestHostMemType);
+
+    m_deviceMemType = bestDeviceMemType;
+    m_hostMemType = bestHostMemType;
+}
+
+VkDeviceMemory Device::allocate(int memType, uint64_t numBytes) {
+    VkMemoryAllocateInfo allocateInfo = {};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocateInfo.memoryTypeIndex = memType;
+    allocateInfo.allocationSize = numBytes;
+
+    VkDeviceMemory memory;
+    VkResult result = vk->AllocateMemory(device, &allocateInfo, nullptr, &memory);
+    if (result == VK_SUCCESS)
+        return memory;
+
+    const char *errorStr = "unknown";
+    switch (result) {
+    case VK_ERROR_OUT_OF_HOST_MEMORY: errorStr = "out of host (CPU) memory"; break;
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: errorStr = "out of device (GPU) memory"; break;
+    default: break;
+    }
+
+    fprintf(stderr, "%s: attempting to allocate %s failed.\n", __func__, formatNumBytes(numBytes).c_str());
+    fprintf(stderr, "%s: error: %s (%d)\n", __func__, errorStr, result);
+
+    return nullptr;
+}
+
+void Device::free(VkDeviceMemory memory) {
+    vk->FreeMemory(device, memory, nullptr);
+}
 
 class OwnedDevice : public Device {
 public:
@@ -433,6 +553,8 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
                           &ownedDevice.transferQueue);
     }
 
+    ownedDevice.init(physicalDevice);
+
     return std::move(ownedDevice);
 }
 
@@ -469,7 +591,8 @@ static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
 
 class LlamaContext {
 public:
-    LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo);
+    LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
+                 unsigned maxCacheEntries);
     ~LlamaContext();
 
 private:
@@ -481,10 +604,14 @@ private:
     VkPipeline createPipeline(const std::string &kernelName);
     void destroy();
 
+    uint64_t calcQ4Size(unsigned quantizedDim, unsigned other);
+
     Instance &vk;
     Device &device;
 
+    unsigned m_numVocab;
     unsigned m_numLayers;
+    unsigned m_maxCacheEntries;
 
     VkPipeline m_kernelThinFp16Attention = nullptr;
     VkPipeline m_kernelThinFp16RmsNorm = nullptr;
@@ -497,6 +624,19 @@ private:
 
     VkDescriptorPool m_descriptorPool = nullptr;
 
+    struct LayerDescriptorSets {
+        VkDescriptorSet layer = nullptr;
+        VkDescriptorSet kernelAttentionRms = nullptr;
+        VkDescriptorSet kernelAttention = nullptr;
+    };
+
+    // VkDescriptorSet m_dsetGlobal[2] = {};
+    // std::vector<LayerDescriptorSets> m_dsetLayer;
+
+    VkDeviceMemory m_globalMemory;
+    std::vector<VkDeviceMemory> m_layerMemory;
+    VkDeviceMemory m_hostMemory;
+
     std::string m_modelPath;
     llama_file_info m_fileInfo;
 
@@ -504,12 +644,16 @@ private:
     VkSpecializationInfo m_specInfo;
 };
 
-LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo)
+LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
+                           unsigned maxCacheEntries)
     : vk(vk), device(device), m_modelPath(modelPath), m_fileInfo(fileInfo)
 {
+    m_numVocab = fileInfo.n_vocab;
     m_numLayers = fileInfo.n_layer;
+    m_maxCacheEntries = maxCacheEntries;
     m_specData.nEmbd = fileInfo.n_embd;
 
+    // Step 1: Descriptor set and pipeline layouts and pipelines
     m_specInfo.mapEntryCount = sizeof(g_specMapEntries) / sizeof(g_specMapEntries[0]);
     m_specInfo.pMapEntries = g_specMapEntries;
     m_specInfo.dataSize = sizeof(m_specData);
@@ -531,13 +675,11 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     pipelineLayoutCreateInfo.pSetLayouts = setLayouts;
     LLVK_CHECK_RESULT(vk.CreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout));
 
-    unsigned globalSets = 2;
-    unsigned layerSets = 2 * m_numLayers;
+    unsigned globalSets = 2; // Double buffer
+    unsigned layerSets = m_numLayers;
     unsigned kernelSets =
-        2 * (
             0 +
-            m_numLayers * 2
-        );
+            m_numLayers * 2;
 
     const VkDescriptorPoolSize poolSizes[] = {
         {
@@ -563,6 +705,40 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
     m_kernelThinFp16RmsNorm = createPipeline("KernelThinFp16RmsNorm");
     m_kernelThinFp16Attention = createPipeline("KernelThinFp16Attention");
+
+    // Step 2: Memory allocation
+    //
+    // Allocate memory in per-layer chunks since some implementations can't
+    // allocate more than ~2 GiB in a single allocation.
+    {
+        uint64_t attnMatrixSize = alignPot(calcQ4Size(m_specData.nEmbd, m_specData.nEmbd), 256);
+        uint64_t cacheSize = alignPot(2 * 2 * m_specData.nEmbd * m_maxCacheEntries, 256);
+        uint64_t layerSize = 4 * attnMatrixSize + cacheSize;
+
+        uint64_t embdMatrixSize = alignPot(calcQ4Size(m_specData.nEmbd, m_numVocab), 256);
+        uint64_t historyIndexSize = 2 * 2048;
+        uint64_t globalSize =
+            2 * alignPot(sizeof(shader::GlobalConstantBuffer), 256)
+            + historyIndexSize
+            + embdMatrixSize;
+
+        printf("vulkan: allocating %s of device memory\n",
+               formatNumBytes(globalSize + m_numLayers * layerSize).c_str());
+
+        m_globalMemory = device.allocateDevice(globalSize);
+        if (!m_globalMemory)
+            exit(1);
+
+        for (unsigned i = 0; i < m_numLayers; ++i) {
+            auto memory = device.allocateDevice(layerSize);
+            if (!memory)
+                exit(1);
+            m_layerMemory.push_back(memory);
+        }
+    }
+    // VkDeviceMemory m_globalMemory;
+    // std::vector<VkDeviceMemory> m_layerMemory;
+    // VkDeviceMemory m_hostMemory;
 }
 
 LlamaContext::~LlamaContext() {
@@ -570,6 +746,21 @@ LlamaContext::~LlamaContext() {
 }
 
 void LlamaContext::destroy() {
+#define DESTROY(name) \
+    do { \
+        if (name) { \
+            vk.FreeMemory(device, name, nullptr); \
+            name = nullptr; \
+        } \
+    } while(false)
+
+    DESTROY(m_hostMemory);
+    DESTROY(m_globalMemory);
+    for (auto &memory : m_layerMemory)
+        DESTROY(memory);
+
+#undef DESTROY
+
     if (m_descriptorPool) {
         vk.DestroyDescriptorPool(device, m_descriptorPool, nullptr);
         m_descriptorPool = nullptr;
@@ -581,10 +772,12 @@ void LlamaContext::destroy() {
     }
 
 #define DESTROY(name) \
-    if (name) { \
-        vk.DestroyDescriptorSetLayout(device, name, nullptr); \
-        name = nullptr; \
-    }
+    do { \
+        if (name) { \
+            vk.DestroyDescriptorSetLayout(device, name, nullptr); \
+            name = nullptr; \
+        } \
+    } while(false)
 
     DESTROY(m_dsetLayoutGlobal);
     DESTROY(m_dsetLayoutPerKernel);
@@ -592,15 +785,23 @@ void LlamaContext::destroy() {
 
 #undef DESTROY
 #define DESTROY(name) \
-    if (name) { \
-        vk.DestroyPipeline(device, name, nullptr); \
-        name = nullptr; \
-    }
+    do { \
+        if (name) { \
+            vk.DestroyPipeline(device, name, nullptr); \
+            name = nullptr; \
+        } \
+    } while(false)
 
     DESTROY(m_kernelThinFp16Attention);
     DESTROY(m_kernelThinFp16RmsNorm);
 
 #undef DESTROY
+}
+
+uint64_t LlamaContext::calcQ4Size(unsigned quantizedDim, unsigned other) {
+    unsigned numBlocks = (quantizedDim + 63) / 64;
+    unsigned blockSize = 4 + 32;
+    return blockSize * numBlocks * other;
 }
 
 VkDescriptorSetLayout LlamaContext::createDescriptorSetLayoutImpl(
@@ -863,7 +1064,7 @@ int main(int argc, char **argv) {
     if (!ctx)
         exit(1);
 
-    llvk::LlamaContext vkctx(vk, device, params.model, model_file_info);
+    llvk::LlamaContext vkctx(vk, device, params.model, model_file_info, 2048);
 
     // Add a space in front of the first character to match OG llama tokenizer behavior
     params.prompt.insert(0, 1, ' ');
@@ -876,6 +1077,5 @@ int main(int argc, char **argv) {
         printf("  %u: '%s'\n", token, llama_token_to_str(ctx, token));
     printf("--\n");
 
-    printf("Hi rebuild\n");
     return 0;
 }
