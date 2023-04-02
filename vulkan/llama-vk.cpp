@@ -1,9 +1,14 @@
 
 #include <array>
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
+
+#include "../llama.h"
 
 #include "vulkan/vulkan.h"
 
@@ -149,6 +154,7 @@ public:
         : vk(&vk), device(device), computeQueue(computeQueue)
         , transferQueue(transferQueue) {}
 
+    operator VkDevice() { return device; }
 };
 
 class OwnedDevice : public Device {
@@ -237,10 +243,43 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
         printf("   Driver Name: %s\n", vulkan12.driverName);
         printf("   Driver Info: %s\n", vulkan12.driverInfo);
 
+        auto reportMissingFeature = [](const char *name) {
+            printf("   --- ignoring device because it does not support %s\n", name);
+        };
+
         if (properties.properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0)) {
-            printf("   --- ignoring device, require Vulkan 1.3\n");
+            reportMissingFeature("Vulkan 1.3");
             continue;
         }
+
+        VkPhysicalDeviceVulkan13Features vulkan13Features = {};
+        vulkan13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+
+        VkPhysicalDeviceVulkan12Features vulkan12Features = {};
+        vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        vulkan12Features.pNext = &vulkan13Features;
+
+        VkPhysicalDeviceVulkan11Features vulkan11Features = {};
+        vulkan11Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+        vulkan11Features.pNext = &vulkan12Features;
+
+        VkPhysicalDeviceFeatures2 features = {};
+        features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features.pNext = &vulkan11Features;
+        vk.GetPhysicalDeviceFeatures2(physicalDevice, &features);
+
+#define FEATURE_CHECK(strct, field) \
+        if (!strct.field) { \
+            reportMissingFeature(#field); \
+            continue; \
+        }
+
+        FEATURE_CHECK(features.features, shaderInt16)
+        FEATURE_CHECK(vulkan11Features, storageBuffer16BitAccess)
+        FEATURE_CHECK(vulkan12Features, shaderFloat16)
+        FEATURE_CHECK(vulkan13Features, computeFullSubgroups)
+
+#undef FEATURE_CHECK
 
         if (best < 0 || deviceTypePriority(deviceType) > deviceTypePriority(bestType)) {
             best = idx;
@@ -357,8 +396,28 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
         queueCreateInfo.pQueuePriorities = queuePriorities;
     }
 
+    VkPhysicalDeviceVulkan13Features vulkan13Features = {};
+    vulkan13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    vulkan13Features.computeFullSubgroups = true;
+
+    VkPhysicalDeviceVulkan12Features vulkan12Features = {};
+    vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vulkan12Features.pNext = &vulkan13Features;
+    vulkan12Features.shaderFloat16 = true;
+
+    VkPhysicalDeviceVulkan11Features vulkan11Features = {};
+    vulkan11Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    vulkan11Features.pNext = &vulkan12Features;
+    vulkan11Features.storageBuffer16BitAccess = true;
+
+    VkPhysicalDeviceFeatures2 features = {};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &vulkan11Features;
+    features.features.shaderInt16 = true;
+
     VkDeviceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    createInfo.pNext = &features;
     createInfo.queueCreateInfoCount = queueCreateInfos.size();
     createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
@@ -377,13 +436,445 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
     return std::move(ownedDevice);
 }
 
+struct SpecConstants {
+    uint nEmbd = 6656;
+    uint nCtx = 2048;
+    float rotaryTheta = 10000.0;
+};
+static const VkSpecializationMapEntry g_specMapEntries[] = {
+    { 0, offsetof(SpecConstants, nEmbd), sizeof(SpecConstants::nEmbd) },
+    { 1, offsetof(SpecConstants, nCtx), sizeof(SpecConstants::nCtx) },
+    { 2, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
+};
+
+static const VkDescriptorSetLayoutBinding g_dsetLayoutGlobal[] = {
+    { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // constants
+    { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // history indices
+};
+
+static const VkDescriptorSetLayoutBinding g_dsetLayoutPerKernel[] = {
+    { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // input
+    { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // output
+};
+
+static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
+    { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // attention norm
+    { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // Wq
+    { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // Wk
+    { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // Wv
+    { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // Wo
+    { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // key cache
+    { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // value cache
+};
+
+class LlamaContext {
+public:
+    LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo);
+    ~LlamaContext();
+
+private:
+    VkDescriptorSetLayout createDescriptorSetLayoutImpl(const VkDescriptorSetLayoutBinding *bindings, size_t count);
+    template <int N>
+    VkDescriptorSetLayout createDescriptorSetLayout(const VkDescriptorSetLayoutBinding (&bindings)[N]) {
+        return createDescriptorSetLayoutImpl(bindings, N);
+    }
+    VkPipeline createPipeline(const std::string &kernelName);
+    void destroy();
+
+    Instance &vk;
+    Device &device;
+
+    unsigned m_numLayers;
+
+    VkPipeline m_kernelThinFp16Attention = nullptr;
+    VkPipeline m_kernelThinFp16RmsNorm = nullptr;
+
+    VkPipelineLayout m_pipelineLayout = nullptr;
+
+    VkDescriptorSetLayout m_dsetLayoutGlobal = nullptr;
+    VkDescriptorSetLayout m_dsetLayoutPerKernel = nullptr;
+    VkDescriptorSetLayout m_dsetLayoutPerLayer = nullptr;
+
+    VkDescriptorPool m_descriptorPool = nullptr;
+
+    std::string m_modelPath;
+    llama_file_info m_fileInfo;
+
+    SpecConstants m_specData;
+    VkSpecializationInfo m_specInfo;
+};
+
+LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo)
+    : vk(vk), device(device), m_modelPath(modelPath), m_fileInfo(fileInfo)
+{
+    m_numLayers = fileInfo.n_layer;
+    m_specData.nEmbd = fileInfo.n_embd;
+
+    m_specInfo.mapEntryCount = sizeof(g_specMapEntries) / sizeof(g_specMapEntries[0]);
+    m_specInfo.pMapEntries = g_specMapEntries;
+    m_specInfo.dataSize = sizeof(m_specData);
+    m_specInfo.pData = &m_specData;
+
+    m_dsetLayoutGlobal = createDescriptorSetLayout(g_dsetLayoutGlobal);
+    m_dsetLayoutPerKernel = createDescriptorSetLayout(g_dsetLayoutPerKernel);
+    m_dsetLayoutPerLayer = createDescriptorSetLayout(g_dsetLayoutPerLayer);
+
+    const VkDescriptorSetLayout setLayouts[] = {
+        m_dsetLayoutGlobal,
+        m_dsetLayoutPerKernel,
+        m_dsetLayoutPerLayer,
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {};
+    pipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutCreateInfo.setLayoutCount = sizeof(setLayouts) / sizeof(setLayouts[0]);
+    pipelineLayoutCreateInfo.pSetLayouts = setLayouts;
+    LLVK_CHECK_RESULT(vk.CreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout));
+
+    unsigned globalSets = 2;
+    unsigned layerSets = 2 * m_numLayers;
+    unsigned kernelSets =
+        2 * (
+            0 +
+            m_numLayers * 2
+        );
+
+    const VkDescriptorPoolSize poolSizes[] = {
+        {
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                globalSets * 1,
+        },
+        {
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                (uint32_t)(
+                    globalSets * 1
+                    + layerSets * sizeof(g_dsetLayoutPerLayer) / sizeof(g_dsetLayoutPerLayer[0])
+                    + kernelSets * sizeof(g_dsetLayoutPerKernel) / sizeof(g_dsetLayoutPerKernel[0])
+                ),
+        },
+    };
+
+    VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {};
+    descriptorPoolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    descriptorPoolCreateInfo.maxSets = globalSets + layerSets + kernelSets;
+    descriptorPoolCreateInfo.poolSizeCount = sizeof(poolSizes) / sizeof(poolSizes[0]);
+    descriptorPoolCreateInfo.pPoolSizes = poolSizes;
+    LLVK_CHECK_RESULT(vk.CreateDescriptorPool(device, &descriptorPoolCreateInfo, nullptr, &m_descriptorPool));
+
+    m_kernelThinFp16RmsNorm = createPipeline("KernelThinFp16RmsNorm");
+    m_kernelThinFp16Attention = createPipeline("KernelThinFp16Attention");
+}
+
+LlamaContext::~LlamaContext() {
+    destroy();
+}
+
+void LlamaContext::destroy() {
+    if (m_descriptorPool) {
+        vk.DestroyDescriptorPool(device, m_descriptorPool, nullptr);
+        m_descriptorPool = nullptr;
+    }
+
+    if (m_pipelineLayout) {
+        vk.DestroyPipelineLayout(device, m_pipelineLayout, nullptr);
+        m_pipelineLayout = nullptr;
+    }
+
+#define DESTROY(name) \
+    if (name) { \
+        vk.DestroyDescriptorSetLayout(device, name, nullptr); \
+        name = nullptr; \
+    }
+
+    DESTROY(m_dsetLayoutGlobal);
+    DESTROY(m_dsetLayoutPerKernel);
+    DESTROY(m_dsetLayoutPerLayer);
+
+#undef DESTROY
+#define DESTROY(name) \
+    if (name) { \
+        vk.DestroyPipeline(device, name, nullptr); \
+        name = nullptr; \
+    }
+
+    DESTROY(m_kernelThinFp16Attention);
+    DESTROY(m_kernelThinFp16RmsNorm);
+
+#undef DESTROY
+}
+
+VkDescriptorSetLayout LlamaContext::createDescriptorSetLayoutImpl(
+        const VkDescriptorSetLayoutBinding *bindings, size_t count) {
+    VkDescriptorSetLayoutCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    createInfo.bindingCount = count;
+    createInfo.pBindings = bindings;
+
+    VkDescriptorSetLayout setLayout;
+    LLVK_CHECK_RESULT(vk.CreateDescriptorSetLayout(device, &createInfo, nullptr, &setLayout));
+
+    return setLayout;
+}
+
+VkPipeline LlamaContext::createPipeline(const std::string &kernelName) {
+    std::string spvName = "vulkan/" + kernelName + ".spv";
+    std::ifstream fin(spvName.c_str(), std::ios::binary);
+    if (!fin) {
+        fprintf(stderr, "%s: failed to open '%s' for reading\n", __func__, spvName.c_str());
+        exit(1);
+    }
+
+    std::vector<char> buf;
+    fin.seekg(0, std::ios::end);
+    buf.resize(fin.tellg());
+    fin.seekg(0);
+    fin.read(buf.data(), buf.size());
+
+    VkShaderModuleCreateInfo shaderModuleCreateInfo = {};
+    shaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderModuleCreateInfo.codeSize = buf.size();
+    shaderModuleCreateInfo.pCode = (uint32_t *)buf.data();
+
+    VkShaderModule shaderModule;
+    LLVK_CHECK_RESULT(vk.CreateShaderModule(device, &shaderModuleCreateInfo, nullptr, &shaderModule));
+
+    VkComputePipelineCreateInfo computePipelineCreateInfo = {};
+    computePipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    computePipelineCreateInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    computePipelineCreateInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    computePipelineCreateInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    computePipelineCreateInfo.stage.module = shaderModule;
+    computePipelineCreateInfo.stage.pName = kernelName.c_str();
+    computePipelineCreateInfo.stage.pSpecializationInfo = &m_specInfo;
+    computePipelineCreateInfo.layout = m_pipelineLayout;
+
+    VkPipeline pipeline;
+    LLVK_CHECK_RESULT(vk.CreateComputePipelines(device, nullptr, 1, &computePipelineCreateInfo, nullptr, &pipeline));
+
+    vk.DestroyShaderModule(device, shaderModule, nullptr);
+
+    return pipeline;
+}
+
 } // namespace llvk
 
+struct llvk_params {
+    std::string model;
+    int32_t n_parts = -1;   // amount of model parts (-1 = determine from model dimensions)
+
+    // sampling parameters
+    int32_t seed = -1;
+    int32_t top_k = 40;
+    float   top_p = 0.95f;
+    float   temp  = 0.80f;
+    int32_t repeat_last_n = 64;   // last n tokens to penalize
+    float   repeat_penalty  = 1.10f;
+
+    // driver parameters
+    std::string prompt = "";
+    int32_t n_predict = 128; // max. num tokens to predict
+
+    bool memory_f16        = true;  // use f16 instead of f32 for memory kv
+    bool use_color         = false; // use color to distinguish generations and inputs
+    bool interactive       = false; // interactive mode
+
+    bool embedding         = false; // get only sentence embedding
+    bool interactive_start = false; // wait for user input immediately
+
+    bool instruct          = false; // instruction mode (used for Alpaca models)
+    bool ignore_eos        = false; // do not stop generating after eos
+    bool perplexity        = false; // compute perplexity over the prompt
+    bool mem_test          = false; // compute maximum memory usage
+    bool verbose_prompt    = false; // print prompt tokens before generation
+};
+
+static void print_usage(int /*argc*/, char ** argv, const llvk_params & params) {
+    fprintf(stderr, "usage: %s [options]\n", argv[0]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "options:\n");
+    fprintf(stderr, "  -h, --help            show this help message and exit\n");
+    fprintf(stderr, "  -i, --interactive     run in interactive mode\n");
+    fprintf(stderr, "  --interactive-first   run in interactive mode and wait for input right away\n");
+    fprintf(stderr, "  -ins, --instruct      run in instruction mode (use with Alpaca models)\n");
+    fprintf(stderr, "  --color               colorise output to distinguish prompt and user input from generations\n");
+    fprintf(stderr, "  -s SEED, --seed SEED  RNG seed (default: -1, use random seed for <= 0)\n");
+    fprintf(stderr, "  -p PROMPT, --prompt PROMPT\n");
+    fprintf(stderr, "                        prompt to start generation with (default: empty)\n");
+    fprintf(stderr, "  -f FNAME, --file FNAME\n");
+    fprintf(stderr, "                        prompt file to start generation.\n");
+    fprintf(stderr, "  -n N, --n_predict N   number of tokens to predict (default: %d, -1 - infinity)\n", params.n_predict);
+    fprintf(stderr, "  --top_k N             top-k sampling (default: %d)\n", params.top_k);
+    fprintf(stderr, "  --top_p N             top-p sampling (default: %.1f)\n", params.top_p);
+    fprintf(stderr, "  --repeat_last_n N     last n tokens to consider for penalize (default: %d)\n", params.repeat_last_n);
+    fprintf(stderr, "  --repeat_penalty N    penalize repeat sequence of tokens (default: %.1f)\n", params.repeat_penalty);
+    fprintf(stderr, "  --ignore-eos          ignore end of stream token and continue generating\n");
+    fprintf(stderr, "  --temp N              temperature (default: %.1f)\n", params.temp);
+    fprintf(stderr, "  --n_parts N           number of model parts (default: -1 = determine from dimensions)\n");
+    fprintf(stderr, "  --perplexity          compute perplexity over the prompt\n");
+    fprintf(stderr, "  --mtest               compute maximum memory usage\n");
+    fprintf(stderr, "  --verbose-prompt      print prompt before generation\n");
+    fprintf(stderr, "  -m FNAME, --model FNAME\n");
+    fprintf(stderr, "                        model path\n");
+    fprintf(stderr, "\n");
+}
+
+static void params_parse(int argc, char ** argv, llvk_params &params) {
+    bool invalid_param = false;
+    std::string arg;
+    for (int i = 1; i < argc; i++) {
+        arg = argv[i];
+
+        if (arg == "-s" || arg == "--seed") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.seed = std::stoi(argv[i]);
+        } else if (arg == "-p" || arg == "--prompt") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.prompt = argv[i];
+        } else if (arg == "-f" || arg == "--file") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            std::ifstream file(argv[i]);
+            std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(), back_inserter(params.prompt));
+            if (params.prompt.back() == '\n') {
+                params.prompt.pop_back();
+            }
+        } else if (arg == "-n" || arg == "--n_predict") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.n_predict = std::stoi(argv[i]);
+        } else if (arg == "--top_k") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.top_k = std::stoi(argv[i]);
+        } else if (arg == "--top_p") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.top_p = std::stof(argv[i]);
+        } else if (arg == "--temp") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.temp = std::stof(argv[i]);
+        } else if (arg == "--repeat_last_n") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.repeat_last_n = std::stoi(argv[i]);
+        } else if (arg == "--repeat_penalty") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.repeat_penalty = std::stof(argv[i]);
+        } else if (arg == "-m" || arg == "--model") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.model = argv[i];
+        } else if (arg == "-i" || arg == "--interactive") {
+            params.interactive = true;
+        } else if (arg == "--embedding") {
+            params.embedding = true;
+        } else if (arg == "--interactive-start") {
+            params.interactive = true;
+        } else if (arg == "--interactive-first") {
+            params.interactive_start = true;
+        } else if (arg == "-ins" || arg == "--instruct") {
+            params.instruct = true;
+        } else if (arg == "--color") {
+            params.use_color = true;
+        } else if (arg == "--mtest") {
+            params.mem_test = true;
+        } else if (arg == "--verbose-prompt") {
+            params.verbose_prompt = true;
+        } else if (arg == "--perplexity") {
+            params.perplexity = true;
+        } else if (arg == "--ignore-eos") {
+            params.ignore_eos = true;
+        } else if (arg == "--n_parts") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.n_parts = std::stoi(argv[i]);
+        } else if (arg == "-h" || arg == "--help") {
+            print_usage(argc, argv, params);
+            exit(0);
+        } else {
+            fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
+            print_usage(argc, argv, params);
+            exit(1);
+        }
+    }
+    if (invalid_param) {
+        fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
+        print_usage(argc, argv, params);
+        exit(1);
+    }
+
+    if (params.model.empty()) {
+        fprintf(stderr, "Specify the model using '-m' or '--model'.\n");
+        exit(1);
+    }
+}
+
+static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
+    // initialize to prompt number of chars, since n_tokens <= n_prompt_chars
+    std::vector<llama_token> res(text.size() + (int)add_bos);
+    int n = llama_tokenize(ctx, text.c_str(), res.data(), res.size(), add_bos);
+    assert(n >= 0);
+    res.resize(n);
+    return res;
+}
+
 int main(int argc, char **argv) {
+    llvk_params params;
+    params_parse(argc, argv, params);
+
     auto vk = llvk::OwnedInstance::createDefault();
 
     auto device = llvk::OwnedDevice::createDefault(vk);
 
+    llama_context_params ctx_params = {};
+    ctx_params.n_ctx = 2048;
+    ctx_params.n_parts = params.n_parts;
+    ctx_params.seed = params.seed;
+    ctx_params.vocab_only = true;
+
+    llama_file_info model_file_info;
+    llama_context *ctx = llama_init_from_file(params.model.c_str(), ctx_params, &model_file_info);
+    if (!ctx)
+        exit(1);
+
+    llvk::LlamaContext vkctx(vk, device, params.model, model_file_info);
+
+    // Add a space in front of the first character to match OG llama tokenizer behavior
+    params.prompt.insert(0, 1, ' ');
+
+    // Tokenize the prompt
+    auto embd_inp = llama_tokenize(ctx, params.prompt.c_str(), true);
+
+    printf("Initial embd_inp:\n");
+    for (const auto &token : embd_inp)
+        printf("  %u: '%s'\n", token, llama_token_to_str(ctx, token));
+    printf("--\n");
 
     printf("Hi rebuild\n");
     return 0;

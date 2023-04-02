@@ -250,8 +250,15 @@ quantize: examples/quantize/quantize.cpp ggml.o llama.o
 perplexity: examples/perplexity/perplexity.cpp ggml.o llama.o common.o
 	$(CXX) $(CXXFLAGS) examples/perplexity/perplexity.cpp ggml.o llama.o common.o -o perplexity $(LDFLAGS)
 
-llama-vk: vulkan/llama-vk.cpp
-	$(CXX) $(CXXFLAGS) vulkan/llama-vk.cpp -lvulkan -o llama-vk
+KERNELS := \
+	KernelThinFp16RmsNorm \
+	KernelThinFp16Attention
+
+llama-vk: vulkan/llama-vk.cpp ggml.o llama.o $(KERNELS:%=vulkan/%.spv)
+	$(CXX) $(CXXFLAGS) vulkan/llama-vk.cpp ggml.o llama.o -lvulkan -o llama-vk
+
+vulkan/%.spv: vulkan/llama-vk.hlsl
+	dxc -spirv -T cs_6_6 -E $* -enable-16bit-types -fspv-target-env=vulkan1.3 -Fo $@ $<
 
 #
 # Tests
