@@ -166,6 +166,36 @@ OwnedInstance::~OwnedInstance() {
         DestroyInstance(theInstance, NULL);
 }
 
+class Device;
+
+class MemoryAndBuffer {
+    friend class Device;
+private:
+    Device *m_device = nullptr;
+    VkBuffer m_buffer = nullptr;
+    VkDeviceMemory m_memory = nullptr;
+
+public:
+    MemoryAndBuffer() {}
+    MemoryAndBuffer(Device *device, VkBuffer buffer, VkDeviceMemory memory)
+        : m_device(device), m_buffer(buffer), m_memory(memory) {}
+    ~MemoryAndBuffer();
+
+    MemoryAndBuffer(MemoryAndBuffer &&rhs);
+    MemoryAndBuffer &operator=(MemoryAndBuffer &&rhs);
+
+    void reset();
+
+    bool valid() const { return m_buffer; }
+
+    VkBuffer buffer() { return m_buffer; }
+    VkDeviceMemory memory() { return m_memory; }
+
+private:
+    MemoryAndBuffer(const MemoryAndBuffer &rhs) = delete;
+    MemoryAndBuffer &operator=(const MemoryAndBuffer &rhs) = delete;
+};
+
 class Device {
 protected:
     Instance *vk = nullptr;
@@ -186,14 +216,16 @@ public:
     void init(VkPhysicalDevice physicalDevice);
 
     operator VkDevice() { return device; }
+    Instance &instance() { return *vk; }
 
-    VkDeviceMemory allocateDevice(uint64_t numBytes) { return allocate(m_deviceMemType, numBytes); }
-    VkDeviceMemory allocateHost(uint64_t numBytes) { return allocate(m_hostMemType, numBytes); }
+    MemoryAndBuffer allocateDevice(uint64_t numBytes) { return allocate(m_deviceMemType, numBytes); }
+    MemoryAndBuffer allocateHost(uint64_t numBytes) { return allocate(m_hostMemType, numBytes); }
 
-    void free(VkDeviceMemory memory);
+    void allocateDescriptorSets(VkDescriptorPool pool, VkDescriptorSetLayout layout,
+                                unsigned count, VkDescriptorSet *sets);
 
 private:
-    VkDeviceMemory allocate(int memType, uint64_t numBytes);
+    MemoryAndBuffer allocate(int memType, uint64_t numBytes);
 };
 
 void Device::init(VkPhysicalDevice physicalDevice) {
@@ -249,32 +281,188 @@ void Device::init(VkPhysicalDevice physicalDevice) {
     m_hostMemType = bestHostMemType;
 }
 
-VkDeviceMemory Device::allocate(int memType, uint64_t numBytes) {
+MemoryAndBuffer Device::allocate(int memType, uint64_t numBytes) {
+    VkBufferCreateInfo bufferCreateInfo = {};
+    bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferCreateInfo.size = numBytes;
+    bufferCreateInfo.usage =
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+    VkBuffer buffer;
+    LLVK_CHECK_RESULT(vk->CreateBuffer(device, &bufferCreateInfo, nullptr, &buffer));
+
+    VkMemoryRequirements requirements;
+    vk->GetBufferMemoryRequirements(device, buffer, &requirements);
+
+    if ((requirements.memoryTypeBits & (1 << memType)) == 0) {
+        fprintf(stderr, "%s: can't allocate buffer in the desired memory type\n", __func__);
+        return {};
+    }
+
     VkMemoryAllocateInfo allocateInfo = {};
     allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocateInfo.memoryTypeIndex = memType;
-    allocateInfo.allocationSize = numBytes;
+    allocateInfo.allocationSize = requirements.size;
 
     VkDeviceMemory memory;
     VkResult result = vk->AllocateMemory(device, &allocateInfo, nullptr, &memory);
-    if (result == VK_SUCCESS)
-        return memory;
+    if (result != VK_SUCCESS) {
+        const char *errorStr = "unknown";
+        switch (result) {
+        case VK_ERROR_OUT_OF_HOST_MEMORY: errorStr = "out of host (CPU) memory"; break;
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: errorStr = "out of device (GPU) memory"; break;
+        default: break;
+        }
 
-    const char *errorStr = "unknown";
-    switch (result) {
-    case VK_ERROR_OUT_OF_HOST_MEMORY: errorStr = "out of host (CPU) memory"; break;
-    case VK_ERROR_OUT_OF_DEVICE_MEMORY: errorStr = "out of device (GPU) memory"; break;
-    default: break;
+        fprintf(stderr, "%s: attempting to allocate %s failed.\n", __func__, formatNumBytes(numBytes).c_str());
+        fprintf(stderr, "%s: error: %s (%d)\n", __func__, errorStr, result);
+
+        vk->DestroyBuffer(device, buffer, nullptr);
+        return {};
     }
 
-    fprintf(stderr, "%s: attempting to allocate %s failed.\n", __func__, formatNumBytes(numBytes).c_str());
-    fprintf(stderr, "%s: error: %s (%d)\n", __func__, errorStr, result);
+    LLVK_CHECK_RESULT(vk->BindBufferMemory(device, buffer, memory, 0));
 
-    return nullptr;
+    return {this, buffer, memory};
 }
 
-void Device::free(VkDeviceMemory memory) {
-    vk->FreeMemory(device, memory, nullptr);
+void Device::allocateDescriptorSets(VkDescriptorPool pool, VkDescriptorSetLayout layout,
+                                    unsigned count, VkDescriptorSet *sets) {
+    std::vector<VkDescriptorSetLayout> layouts(count, layout);
+
+    VkDescriptorSetAllocateInfo allocateInfo = {};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = pool;
+    allocateInfo.descriptorSetCount = count;
+    allocateInfo.pSetLayouts = layouts.data();
+    LLVK_CHECK_RESULT(vk->AllocateDescriptorSets(device, &allocateInfo, sets));
+}
+
+MemoryAndBuffer::~MemoryAndBuffer() {
+    reset();
+}
+
+MemoryAndBuffer::MemoryAndBuffer(MemoryAndBuffer &&rhs) : MemoryAndBuffer() {
+    *this = std::move(rhs);
+}
+
+MemoryAndBuffer &MemoryAndBuffer::operator=(MemoryAndBuffer &&rhs) {
+    if (this != &rhs) {
+        reset();
+
+        m_device = rhs.m_device;
+        m_buffer = rhs.m_buffer;
+        m_memory = rhs.m_memory;
+
+        rhs.m_buffer = nullptr;
+        rhs.m_memory = nullptr;
+    }
+    return *this;
+}
+
+void MemoryAndBuffer::reset() {
+    if (m_buffer) {
+        auto &vk = m_device->instance();
+        vk.FreeMemory(*m_device, m_memory, nullptr);
+        vk.DestroyBuffer(*m_device, m_buffer, nullptr);
+
+        m_buffer = nullptr;
+        m_memory = nullptr;
+    }
+}
+
+struct Range {
+    uint64_t offset = 0;
+    uint64_t range = 0;
+};
+
+class WriteBufferDescriptors {
+public:
+    WriteBufferDescriptors(Device &device) : m_device(device) {}
+    ~WriteBufferDescriptors() {
+        // Must explicitly commit
+        assert(m_descriptorWrites.empty());
+    }
+
+    void commit();
+    void reset();
+
+    void write(VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+               VkBuffer buffer, Range range);
+    void writeUniform(VkDescriptorSet set, uint32_t binding, VkBuffer buffer, Range range);
+    void writeStorage(VkDescriptorSet set, uint32_t binding, VkBuffer buffer, Range range);
+
+private:
+    Device &m_device;
+    std::vector<VkDescriptorBufferInfo> m_bufferInfos;
+    std::vector<VkWriteDescriptorSet> m_descriptorWrites;
+    std::vector<size_t> m_offsets;
+};
+
+void WriteBufferDescriptors::commit() {
+    if (m_descriptorWrites.empty())
+        return;
+
+    for (size_t i = 0; i < m_descriptorWrites.size(); ++i) {
+        m_descriptorWrites[i].pBufferInfo = &m_bufferInfos[m_offsets[i]];
+    }
+
+    m_device.instance().UpdateDescriptorSets(
+        m_device, m_descriptorWrites.size(), m_descriptorWrites.data(), 0, nullptr);
+
+    reset();
+}
+
+void WriteBufferDescriptors::reset() {
+    m_bufferInfos.clear();
+    m_descriptorWrites.clear();
+    m_offsets.clear();
+}
+
+void WriteBufferDescriptors::write(
+        VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+        VkBuffer buffer, Range range) {
+    VkDescriptorBufferInfo bufferInfo;
+    bufferInfo.buffer = buffer;
+    bufferInfo.offset = range.offset;
+    bufferInfo.range = range.range;
+
+    if (!m_descriptorWrites.empty()) {
+        auto &write = m_descriptorWrites.back();
+        if (write.descriptorType == type && write.dstSet == set &&
+            write.dstBinding + write.descriptorCount == binding)
+        {
+            m_bufferInfos.push_back(bufferInfo);
+            write.descriptorCount++;
+            return;
+        }
+    }
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.descriptorType = type;
+    write.descriptorCount = 1;
+    m_descriptorWrites.push_back(write);
+
+    m_offsets.push_back(m_bufferInfos.size());
+    m_bufferInfos.push_back(bufferInfo);
+}
+
+void WriteBufferDescriptors::writeUniform(
+        VkDescriptorSet set, uint32_t binding,
+        VkBuffer buffer, Range range) {
+    write(set, binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, buffer, range);
+}
+
+void WriteBufferDescriptors::writeStorage(
+        VkDescriptorSet set, uint32_t binding,
+        VkBuffer buffer, Range range) {
+    write(set, binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, buffer, range);
 }
 
 class OwnedDevice : public Device {
@@ -624,17 +812,31 @@ private:
 
     VkDescriptorPool m_descriptorPool = nullptr;
 
-    struct LayerDescriptorSets {
-        VkDescriptorSet layer = nullptr;
-        VkDescriptorSet kernelAttentionRms = nullptr;
-        VkDescriptorSet kernelAttention = nullptr;
-    };
+    VkDescriptorSet m_dsetGlobal[2] = {};
+    VkDescriptorSet m_dsetKernel[3] = {};
+    std::vector<VkDescriptorSet> m_dsetLayer;
 
-    // VkDescriptorSet m_dsetGlobal[2] = {};
-    // std::vector<LayerDescriptorSets> m_dsetLayer;
+    struct {
+        uint64_t size = 0;
+        Range constants[2];
+        Range historyIndex;
+        Range embedding;
+        Range activations[3];
+    } m_globalOffsets;
+    MemoryAndBuffer m_globalMemory;
 
-    VkDeviceMemory m_globalMemory;
-    std::vector<VkDeviceMemory> m_layerMemory;
+    struct {
+        uint64_t size = 0;
+        Range attentionNorm;
+        Range Wq;
+        Range Wk;
+        Range Wv;
+        Range Wo;
+        Range cacheKeys;
+        Range cacheValues;
+    } m_layerOffsets;
+    std::vector<MemoryAndBuffer> m_layerMemory;
+
     VkDeviceMemory m_hostMemory;
 
     std::string m_modelPath;
@@ -675,34 +877,6 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     pipelineLayoutCreateInfo.pSetLayouts = setLayouts;
     LLVK_CHECK_RESULT(vk.CreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout));
 
-    unsigned globalSets = 2; // Double buffer
-    unsigned layerSets = m_numLayers;
-    unsigned kernelSets =
-            0 +
-            m_numLayers * 2;
-
-    const VkDescriptorPoolSize poolSizes[] = {
-        {
-                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                globalSets * 1,
-        },
-        {
-                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                (uint32_t)(
-                    globalSets * 1
-                    + layerSets * sizeof(g_dsetLayoutPerLayer) / sizeof(g_dsetLayoutPerLayer[0])
-                    + kernelSets * sizeof(g_dsetLayoutPerKernel) / sizeof(g_dsetLayoutPerKernel[0])
-                ),
-        },
-    };
-
-    VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {};
-    descriptorPoolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descriptorPoolCreateInfo.maxSets = globalSets + layerSets + kernelSets;
-    descriptorPoolCreateInfo.poolSizeCount = sizeof(poolSizes) / sizeof(poolSizes[0]);
-    descriptorPoolCreateInfo.pPoolSizes = poolSizes;
-    LLVK_CHECK_RESULT(vk.CreateDescriptorPool(device, &descriptorPoolCreateInfo, nullptr, &m_descriptorPool));
-
     m_kernelThinFp16RmsNorm = createPipeline("KernelThinFp16RmsNorm");
     m_kernelThinFp16Attention = createPipeline("KernelThinFp16Attention");
 
@@ -711,34 +885,108 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     // Allocate memory in per-layer chunks since some implementations can't
     // allocate more than ~2 GiB in a single allocation.
     {
-        uint64_t attnMatrixSize = alignPot(calcQ4Size(m_specData.nEmbd, m_specData.nEmbd), 256);
-        uint64_t cacheSize = alignPot(2 * 2 * m_specData.nEmbd * m_maxCacheEntries, 256);
-        uint64_t layerSize = 4 * attnMatrixSize + cacheSize;
+#define OFFSET(memory, sub, bytes) \
+        do { \
+            memory.sub.offset = memory.size; \
+            memory.sub.range = (bytes); \
+            memory.size += alignPot((bytes), 256); \
+        } while (false)
 
-        uint64_t embdMatrixSize = alignPot(calcQ4Size(m_specData.nEmbd, m_numVocab), 256);
-        uint64_t historyIndexSize = 2 * 2048;
-        uint64_t globalSize =
-            2 * alignPot(sizeof(shader::GlobalConstantBuffer), 256)
-            + historyIndexSize
-            + embdMatrixSize;
+        OFFSET(m_layerOffsets, attentionNorm, 2 * m_specData.nEmbd);
+
+        uint64_t attnMatrixSize = calcQ4Size(m_specData.nEmbd, m_specData.nEmbd);
+        OFFSET(m_layerOffsets, Wq, attnMatrixSize);
+        OFFSET(m_layerOffsets, Wk, attnMatrixSize);
+        OFFSET(m_layerOffsets, Wv, attnMatrixSize);
+        OFFSET(m_layerOffsets, Wo, attnMatrixSize);
+
+        uint64_t cacheSize = 2 * m_specData.nEmbd * m_maxCacheEntries;
+        OFFSET(m_layerOffsets, cacheKeys, cacheSize);
+        OFFSET(m_layerOffsets, cacheValues, cacheSize);
+
+        OFFSET(m_globalOffsets, constants[0], sizeof(shader::GlobalConstantBuffer));
+        OFFSET(m_globalOffsets, constants[1], sizeof(shader::GlobalConstantBuffer));
+        OFFSET(m_globalOffsets, historyIndex, 2 * 2048);
+
+        uint64_t embdMatrixSize = calcQ4Size(m_specData.nEmbd, m_numVocab);
+        OFFSET(m_globalOffsets, embedding, embdMatrixSize);
+
+        uint64_t activationSize = 2 * m_specData.nEmbd;
+        OFFSET(m_globalOffsets, activations[0], activationSize);
+        OFFSET(m_globalOffsets, activations[1], activationSize);
+        OFFSET(m_globalOffsets, activations[2], activationSize);
 
         printf("vulkan: allocating %s of device memory\n",
-               formatNumBytes(globalSize + m_numLayers * layerSize).c_str());
+               formatNumBytes(m_globalOffsets.size + m_numLayers * m_layerOffsets.size).c_str());
 
-        m_globalMemory = device.allocateDevice(globalSize);
-        if (!m_globalMemory)
+        m_globalMemory = device.allocateDevice(m_globalOffsets.size);
+        if (!m_globalMemory.valid())
             exit(1);
 
         for (unsigned i = 0; i < m_numLayers; ++i) {
-            auto memory = device.allocateDevice(layerSize);
-            if (!memory)
+            auto memory = device.allocateDevice(m_layerOffsets.size);
+            if (!memory.valid())
                 exit(1);
-            m_layerMemory.push_back(memory);
+            m_layerMemory.push_back(std::move(memory));
         }
     }
-    // VkDeviceMemory m_globalMemory;
-    // std::vector<VkDeviceMemory> m_layerMemory;
-    // VkDeviceMemory m_hostMemory;
+
+    // Step 3: Set up descriptor sets
+    {
+        unsigned globalSets = sizeof(m_dsetGlobal) / sizeof(m_dsetGlobal[0]); // Double buffer
+        unsigned layerSets = m_numLayers;
+        unsigned kernelSets = sizeof(m_dsetKernel) / sizeof(m_dsetKernel[0]); // Triple buffer(?)
+
+        const VkDescriptorPoolSize poolSizes[] = {
+            {
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    globalSets * 1,
+            },
+            {
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    (uint32_t)(
+                        globalSets * 1
+                        + layerSets * sizeof(g_dsetLayoutPerLayer) / sizeof(g_dsetLayoutPerLayer[0])
+                        + kernelSets * sizeof(g_dsetLayoutPerKernel) / sizeof(g_dsetLayoutPerKernel[0])
+                    ),
+            },
+        };
+
+        VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {};
+        descriptorPoolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        descriptorPoolCreateInfo.maxSets = globalSets + layerSets + kernelSets;
+        descriptorPoolCreateInfo.poolSizeCount = sizeof(poolSizes) / sizeof(poolSizes[0]);
+        descriptorPoolCreateInfo.pPoolSizes = poolSizes;
+        LLVK_CHECK_RESULT(vk.CreateDescriptorPool(device, &descriptorPoolCreateInfo, nullptr, &m_descriptorPool));
+
+        device.allocateDescriptorSets(m_descriptorPool, m_dsetLayoutGlobal, globalSets, m_dsetGlobal);
+        device.allocateDescriptorSets(m_descriptorPool, m_dsetLayoutPerKernel, kernelSets, m_dsetKernel);
+        m_dsetLayer.resize(m_numLayers);
+        device.allocateDescriptorSets(m_descriptorPool, m_dsetLayoutPerLayer, m_numLayers, m_dsetLayer.data());
+
+        WriteBufferDescriptors write(device);
+        for (unsigned i = 0; i < globalSets; ++i) {
+            write.writeUniform(m_dsetGlobal[i], 0, m_globalMemory.buffer(), m_globalOffsets.constants[i]);
+            write.writeStorage(m_dsetGlobal[i], 1, m_globalMemory.buffer(), m_globalOffsets.historyIndex);
+        }
+
+        for (unsigned i = 0; i < kernelSets; ++i) {
+            write.writeStorage(m_dsetKernel[i], 0, m_globalMemory.buffer(), m_globalOffsets.activations[i]);
+            write.writeStorage(m_dsetKernel[i], 1, m_globalMemory.buffer(), m_globalOffsets.activations[(i + 1) % kernelSets]);
+        }
+
+        for (unsigned i = 0; i < m_numLayers; ++i) {
+            write.writeStorage(m_dsetLayer[i], 0, m_layerMemory[i].buffer(), m_layerOffsets.attentionNorm);
+            write.writeStorage(m_dsetLayer[i], 1, m_layerMemory[i].buffer(), m_layerOffsets.Wq);
+            write.writeStorage(m_dsetLayer[i], 2, m_layerMemory[i].buffer(), m_layerOffsets.Wk);
+            write.writeStorage(m_dsetLayer[i], 3, m_layerMemory[i].buffer(), m_layerOffsets.Wv);
+            write.writeStorage(m_dsetLayer[i], 4, m_layerMemory[i].buffer(), m_layerOffsets.Wo);
+            write.writeStorage(m_dsetLayer[i], 5, m_layerMemory[i].buffer(), m_layerOffsets.cacheKeys);
+            write.writeStorage(m_dsetLayer[i], 6, m_layerMemory[i].buffer(), m_layerOffsets.cacheValues);
+        }
+
+        write.commit();
+    }
 }
 
 LlamaContext::~LlamaContext() {
@@ -746,21 +994,6 @@ LlamaContext::~LlamaContext() {
 }
 
 void LlamaContext::destroy() {
-#define DESTROY(name) \
-    do { \
-        if (name) { \
-            vk.FreeMemory(device, name, nullptr); \
-            name = nullptr; \
-        } \
-    } while(false)
-
-    DESTROY(m_hostMemory);
-    DESTROY(m_globalMemory);
-    for (auto &memory : m_layerMemory)
-        DESTROY(memory);
-
-#undef DESTROY
-
     if (m_descriptorPool) {
         vk.DestroyDescriptorPool(device, m_descriptorPool, nullptr);
         m_descriptorPool = nullptr;
