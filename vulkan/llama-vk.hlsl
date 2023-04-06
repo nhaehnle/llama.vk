@@ -12,7 +12,8 @@ enum WeightFormat {
 
 [[vk::constant_id(0)]] const uint specNEmbd = 6656; // LLaMa 30B
 [[vk::constant_id(1)]] const uint specNCtx = 2048; // LLaMa
-[[vk::constant_id(2)]] const float specRotaryTheta = 10000.0;
+[[vk::constant_id(2)]] const uint specNFF = 17920; // LLaMa 30B
+[[vk::constant_id(3)]] const float specRotaryTheta = 10000.0;
 
 [[vk::binding(0, 0)]] cbuffer ForwardPassConstants {
     struct {

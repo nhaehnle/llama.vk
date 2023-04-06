@@ -6,7 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../llama.h"
@@ -191,17 +193,49 @@ public:
     VkBuffer buffer() { return m_buffer; }
     VkDeviceMemory memory() { return m_memory; }
 
+    void *map(uint64_t offset, uint64_t size);
+    void unmap();
+
 private:
     MemoryAndBuffer(const MemoryAndBuffer &rhs) = delete;
     MemoryAndBuffer &operator=(const MemoryAndBuffer &rhs) = delete;
+};
+
+class TimelineSemaphore {
+private:
+    Device *m_device = nullptr;
+    VkSemaphore m_semaphore = nullptr;
+
+public:
+    TimelineSemaphore() {}
+    TimelineSemaphore(Device *device, VkSemaphore semaphore)
+        : m_device(device), m_semaphore(semaphore) {}
+    ~TimelineSemaphore();
+
+    TimelineSemaphore(TimelineSemaphore &&rhs);
+    TimelineSemaphore &operator=(TimelineSemaphore &&rhs);
+
+    void reset();
+
+    bool valid() const { return m_semaphore; }
+    VkSemaphore semaphore() { return m_semaphore; }
+
+    bool wait(uint64_t value, uint64_t timeoutNs);
+    void waitForever(uint64_t value);
+
+private:
+    TimelineSemaphore(const TimelineSemaphore &rhs) = delete;
+    TimelineSemaphore &operator=(const TimelineSemaphore &rhs) = delete;
 };
 
 class Device {
 protected:
     Instance *vk = nullptr;
     VkDevice device = nullptr;
-    VkQueue computeQueue = nullptr;
-    VkQueue transferQueue = nullptr;
+    VkQueue m_computeQueue = nullptr;
+    VkQueue m_transferQueue = nullptr;
+    uint32_t m_computeQueueFamily = ~0;
+    uint32_t m_transferQueueFamily = ~0;
     VkPhysicalDeviceMemoryProperties m_memoryProperties;
     int m_deviceMemType = -1;
     int m_hostMemType = -1;
@@ -209,20 +243,35 @@ protected:
     Device() = default;
 
 public:
-    Device(Instance &vk, VkDevice device, VkQueue computeQueue, VkQueue transferQueue)
-        : vk(&vk), device(device), computeQueue(computeQueue)
-        , transferQueue(transferQueue) {}
+    Device(Instance &vk, VkDevice device,
+           VkQueue computeQueue, uint32_t computeQueueFamily,
+           VkQueue transferQueue, uint32_t transferQueueFamily)
+        : vk(&vk), device(device)
+        , m_computeQueue(computeQueue), m_computeQueueFamily(computeQueueFamily)
+        , m_transferQueue(transferQueue), m_transferQueueFamily(transferQueueFamily)
+    {
+        assert(computeQueue != nullptr);
+    }
 
     void init(VkPhysicalDevice physicalDevice);
 
     operator VkDevice() { return device; }
     Instance &instance() { return *vk; }
 
+    bool haveTransferQueue() const { return m_transferQueue != nullptr; }
+    VkQueue transferQueue() { assert(haveTransferQueue()); return m_transferQueue; }
+    VkQueue computeQueue() { return m_computeQueue; }
+    uint32_t transferQueueFamily() const { return m_transferQueueFamily; }
+    uint32_t computeQueueFamily() const { return m_computeQueueFamily; }
+
     MemoryAndBuffer allocateDevice(uint64_t numBytes) { return allocate(m_deviceMemType, numBytes); }
     MemoryAndBuffer allocateHost(uint64_t numBytes) { return allocate(m_hostMemType, numBytes); }
 
     void allocateDescriptorSets(VkDescriptorPool pool, VkDescriptorSetLayout layout,
                                 unsigned count, VkDescriptorSet *sets);
+
+    VkCommandPool createCommandPool(bool transfer);
+    TimelineSemaphore createTimelineSemaphore();
 
 private:
     MemoryAndBuffer allocate(int memType, uint64_t numBytes);
@@ -341,6 +390,34 @@ void Device::allocateDescriptorSets(VkDescriptorPool pool, VkDescriptorSetLayout
     LLVK_CHECK_RESULT(vk->AllocateDescriptorSets(device, &allocateInfo, sets));
 }
 
+VkCommandPool Device::createCommandPool(bool transfer) {
+    assert(!transfer || haveTransferQueue());
+
+    VkCommandPoolCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    createInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    createInfo.queueFamilyIndex = transfer ? m_transferQueueFamily : m_computeQueueFamily;
+
+    VkCommandPool pool;
+    LLVK_CHECK_RESULT(vk->CreateCommandPool(device, &createInfo, nullptr, &pool));
+    return pool;
+}
+
+TimelineSemaphore Device::createTimelineSemaphore() {
+    VkSemaphoreTypeCreateInfo typeCreateInfo = {};
+    typeCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    typeCreateInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    typeCreateInfo.initialValue = 0;
+
+    VkSemaphoreCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    createInfo.pNext = &typeCreateInfo;
+
+    VkSemaphore semaphore;
+    LLVK_CHECK_RESULT(vk->CreateSemaphore(device, &createInfo, nullptr, &semaphore));
+    return {this, semaphore};
+}
+
 MemoryAndBuffer::~MemoryAndBuffer() {
     reset();
 }
@@ -371,6 +448,68 @@ void MemoryAndBuffer::reset() {
 
         m_buffer = nullptr;
         m_memory = nullptr;
+    }
+}
+
+void *MemoryAndBuffer::map(uint64_t offset, uint64_t size) {
+    auto &vk = m_device->instance();
+    void *ptr;
+    LLVK_CHECK_RESULT(vk.MapMemory(*m_device, m_memory, offset, size, 0, &ptr));
+    return ptr;
+}
+
+void MemoryAndBuffer::unmap() {
+    auto &vk = m_device->instance();
+    vk.UnmapMemory(*m_device, m_memory);
+}
+
+TimelineSemaphore::~TimelineSemaphore() {
+    reset();
+}
+
+TimelineSemaphore::TimelineSemaphore(TimelineSemaphore &&rhs) : TimelineSemaphore() {
+    *this = std::move(rhs);
+}
+
+TimelineSemaphore &TimelineSemaphore::operator=(TimelineSemaphore &&rhs) {
+    if (this != &rhs) {
+        reset();
+
+        m_device = rhs.m_device;
+        m_semaphore = rhs.m_semaphore;
+
+        rhs.m_semaphore = nullptr;
+    }
+    return *this;
+}
+
+void TimelineSemaphore::reset() {
+    if (m_semaphore) {
+        auto &vk = m_device->instance();
+        vk.DestroySemaphore(*m_device, m_semaphore, nullptr);
+        m_semaphore = nullptr;
+    }
+}
+
+// Returns true on success, false on timeout.
+bool TimelineSemaphore::wait(uint64_t value, uint64_t timeoutNs) {
+    auto &vk = m_device->instance();
+
+    VkSemaphoreWaitInfo waitInfo = {};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    waitInfo.semaphoreCount = 1,
+    waitInfo.pSemaphores = &m_semaphore;
+    waitInfo.pValues = &value;
+
+    VkResult result = LLVK_CHECK_RESULT(vk.WaitSemaphores(*m_device, &waitInfo, timeoutNs));
+    return result == VK_SUCCESS;
+}
+
+void TimelineSemaphore::waitForever(uint64_t value) {
+    bool success = wait(value, ~(uint64_t)0);
+    if (!success) {
+        fprintf(stderr, "%s: timeout\n", __func__);
+        exit(1);
     }
 }
 
@@ -585,7 +724,9 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
         FEATURE_CHECK(features.features, shaderInt16)
         FEATURE_CHECK(vulkan11Features, storageBuffer16BitAccess)
         FEATURE_CHECK(vulkan12Features, shaderFloat16)
+        FEATURE_CHECK(vulkan12Features, timelineSemaphore)
         FEATURE_CHECK(vulkan13Features, computeFullSubgroups)
+        FEATURE_CHECK(vulkan13Features, synchronization2)
 
 #undef FEATURE_CHECK
 
@@ -707,11 +848,13 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
     VkPhysicalDeviceVulkan13Features vulkan13Features = {};
     vulkan13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     vulkan13Features.computeFullSubgroups = true;
+    vulkan13Features.synchronization2 = true;
 
     VkPhysicalDeviceVulkan12Features vulkan12Features = {};
     vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     vulkan12Features.pNext = &vulkan13Features;
     vulkan12Features.shaderFloat16 = true;
+    vulkan12Features.timelineSemaphore = true;
 
     VkPhysicalDeviceVulkan11Features vulkan11Features = {};
     vulkan11Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
@@ -734,11 +877,13 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
     LLVK_CHECK_RESULT(vk.CreateDevice(physicalDevice, &createInfo, NULL,
                                       &ownedDevice.device));
 
-    vk.GetDeviceQueue(ownedDevice.device, computeQueueFamily, 0, &ownedDevice.computeQueue);
+    vk.GetDeviceQueue(ownedDevice.device, computeQueueFamily, 0, &ownedDevice.m_computeQueue);
+    ownedDevice.m_computeQueueFamily = computeQueueFamily;
     if (transferQueueFamily >= 0) {
         unsigned index = computeQueueFamily == transferQueueFamily ? 1 : 0;
         vk.GetDeviceQueue(ownedDevice.device, transferQueueFamily, index,
-                          &ownedDevice.transferQueue);
+                          &ownedDevice.m_transferQueue);
+        ownedDevice.m_transferQueueFamily = transferQueueFamily;
     }
 
     ownedDevice.init(physicalDevice);
@@ -746,15 +891,35 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
     return std::move(ownedDevice);
 }
 
+// Tensor types on the GPU
+enum {
+    VKTYPE_F16 = 0,
+    VKTYPE_Q4_0 = 1,
+};
+
+uint64_t vktypeSize(int32_t vktype, uint64_t ne0, uint64_t ne1) {
+    switch (vktype) {
+    case VKTYPE_F16:
+        return 2 * ne0 * ne1;
+    case VKTYPE_Q4_0: {
+        assert((ne0 % 64) == 0);
+        return (4 + 32) * (ne0 / 64) * ne1;
+    }
+    }
+    abort();
+}
+
 struct SpecConstants {
     uint nEmbd = 6656;
     uint nCtx = 2048;
+    uint nFF = 17920;
     float rotaryTheta = 10000.0;
 };
 static const VkSpecializationMapEntry g_specMapEntries[] = {
     { 0, offsetof(SpecConstants, nEmbd), sizeof(SpecConstants::nEmbd) },
     { 1, offsetof(SpecConstants, nCtx), sizeof(SpecConstants::nCtx) },
-    { 2, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
+    { 2, offsetof(SpecConstants, nFF), sizeof(SpecConstants::nFF) },
+    { 3, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutGlobal[] = {
@@ -778,10 +943,13 @@ static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
 };
 
 class LlamaContext {
+    struct ModelUploader;
 public:
     LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
                  unsigned maxCacheEntries);
     ~LlamaContext();
+
+    void uploadModel();
 
 private:
     VkDescriptorSetLayout createDescriptorSetLayoutImpl(const VkDescriptorSetLayoutBinding *bindings, size_t count);
@@ -791,8 +959,6 @@ private:
     }
     VkPipeline createPipeline(const std::string &kernelName);
     void destroy();
-
-    uint64_t calcQ4Size(unsigned quantizedDim, unsigned other);
 
     Instance &vk;
     Device &device;
@@ -832,18 +998,25 @@ private:
         Range Wk;
         Range Wv;
         Range Wo;
+        Range ffnNorm;
+        Range W1;
+        Range W2;
+        Range W3;
         Range cacheKeys;
         Range cacheValues;
     } m_layerOffsets;
     std::vector<MemoryAndBuffer> m_layerMemory;
 
-    VkDeviceMemory m_hostMemory;
+    MemoryAndBuffer m_hostMemory;
 
     std::string m_modelPath;
     llama_file_info m_fileInfo;
 
     SpecConstants m_specData;
     VkSpecializationInfo m_specInfo;
+
+    VkCommandPool m_computeCommandPool = nullptr;
+    VkCommandPool m_transferCommandPool = nullptr;
 };
 
 LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
@@ -854,6 +1027,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     m_numLayers = fileInfo.n_layer;
     m_maxCacheEntries = maxCacheEntries;
     m_specData.nEmbd = fileInfo.n_embd;
+    m_specData.nFF = fileInfo.n_ff;
 
     // Step 1: Descriptor set and pipeline layouts and pipelines
     m_specInfo.mapEntryCount = sizeof(g_specMapEntries) / sizeof(g_specMapEntries[0]);
@@ -894,11 +1068,17 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
         OFFSET(m_layerOffsets, attentionNorm, 2 * m_specData.nEmbd);
 
-        uint64_t attnMatrixSize = calcQ4Size(m_specData.nEmbd, m_specData.nEmbd);
+        uint64_t attnMatrixSize = vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd);
         OFFSET(m_layerOffsets, Wq, attnMatrixSize);
         OFFSET(m_layerOffsets, Wk, attnMatrixSize);
         OFFSET(m_layerOffsets, Wv, attnMatrixSize);
         OFFSET(m_layerOffsets, Wo, attnMatrixSize);
+
+        OFFSET(m_layerOffsets, ffnNorm, 2 * m_specData.nEmbd);
+
+        OFFSET(m_layerOffsets, W1, vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF));
+        OFFSET(m_layerOffsets, W2, vktypeSize(VKTYPE_Q4_0, m_specData.nFF, m_specData.nEmbd));
+        OFFSET(m_layerOffsets, W3, vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF));
 
         uint64_t cacheSize = 2 * m_specData.nEmbd * m_maxCacheEntries;
         OFFSET(m_layerOffsets, cacheKeys, cacheSize);
@@ -908,7 +1088,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
         OFFSET(m_globalOffsets, constants[1], sizeof(shader::GlobalConstantBuffer));
         OFFSET(m_globalOffsets, historyIndex, 2 * 2048);
 
-        uint64_t embdMatrixSize = calcQ4Size(m_specData.nEmbd, m_numVocab);
+        uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_numVocab);
         OFFSET(m_globalOffsets, embedding, embdMatrixSize);
 
         uint64_t activationSize = 2 * m_specData.nEmbd;
@@ -987,6 +1167,11 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
         write.commit();
     }
+
+    // Step 4: Allocate command pools
+    m_computeCommandPool = device.createCommandPool(false);
+    if (device.haveTransferQueue())
+        m_transferCommandPool = device.createCommandPool(true);
 }
 
 LlamaContext::~LlamaContext() {
@@ -994,6 +1179,19 @@ LlamaContext::~LlamaContext() {
 }
 
 void LlamaContext::destroy() {
+#define DESTROY(name) \
+    do { \
+        if (name) { \
+            vk.DestroyCommandPool(device, name, nullptr); \
+            name = nullptr; \
+        } \
+    } while(false)
+
+    DESTROY(m_computeCommandPool);
+    DESTROY(m_transferCommandPool);
+
+#undef DESTROY
+
     if (m_descriptorPool) {
         vk.DestroyDescriptorPool(device, m_descriptorPool, nullptr);
         m_descriptorPool = nullptr;
@@ -1029,12 +1227,6 @@ void LlamaContext::destroy() {
     DESTROY(m_kernelThinFp16RmsNorm);
 
 #undef DESTROY
-}
-
-uint64_t LlamaContext::calcQ4Size(unsigned quantizedDim, unsigned other) {
-    unsigned numBlocks = (quantizedDim + 63) / 64;
-    unsigned blockSize = 4 + 32;
-    return blockSize * numBlocks * other;
 }
 
 VkDescriptorSetLayout LlamaContext::createDescriptorSetLayoutImpl(
@@ -1088,6 +1280,608 @@ VkPipeline LlamaContext::createPipeline(const std::string &kernelName) {
     vk.DestroyShaderModule(device, shaderModule, nullptr);
 
     return pipeline;
+}
+
+// Tensor types in GGML files
+enum {
+    FTYPE_F32 = 0,
+    FTYPE_F16 = 1,
+    FTYPE_Q4_0 = 2,
+    FTYPE_Q4_1 = 3,
+};
+
+uint64_t ftypeSize(int32_t ftype, uint64_t ne0, uint64_t ne1) {
+    switch (ftype) {
+    case FTYPE_F32:
+        return 4 * ne0 * ne1;
+    case FTYPE_F16:
+        return 2 * ne0 * ne1;
+    case FTYPE_Q4_0:
+        assert((ne0 % 32) == 0);
+        return (4 + 16) * (ne0 / 32) * ne1;
+    case FTYPE_Q4_1:
+        assert((ne0 % 32) == 0);
+        return (2 * 4 + 16) * (ne0 / 32) * ne1;
+    }
+    abort();
+}
+
+enum {
+    SPLIT_PARTS_COLUMN = 0,
+    SPLIT_PARTS_ROW = 1,
+};
+
+struct TensorOffsets {
+    int32_t ftype;
+    int32_t splitType;
+    int32_t numDims;
+    int32_t numElementsPerPart[2];
+    std::vector<size_t> offsets;
+};
+
+struct TensorUpload {
+    std::string name;
+    int32_t vktype;
+    int32_t numElements[2];
+    VkBuffer buffer;
+    Range range;
+
+    TensorUpload(std::string name, int32_t vktype, uint32_t ne0, uint32_t ne1, VkBuffer buffer, Range range)
+        : name(std::move(name)), vktype(vktype)
+        , numElements{(int32_t)ne0, (int32_t)ne1}
+        , buffer(buffer), range(range) {}
+};
+
+struct LlamaContext::ModelUploader {
+    LlamaContext &ctx;
+    std::unordered_map<std::string, TensorOffsets> m_tensors;
+    std::vector<std::ifstream> m_parts;
+    std::vector<char> m_fileBuffer;
+    TimelineSemaphore m_semaphore;
+    uint64_t m_numSubmits = 0;
+    size_t m_maxUploadSize = 0;
+    MemoryAndBuffer m_uploadBuffer;
+    VkCommandPool m_commandPool = nullptr;
+    VkCommandBuffer m_commandBuffers[2] = {};
+
+    ModelUploader(LlamaContext &ctx) : ctx(ctx) {}
+    ~ModelUploader() { finish(); }
+
+    void lazyInit();
+    void finish();
+
+    void openAndScan();
+    void upload(const TensorUpload *uploads, size_t numUploads);
+    template <size_t N>
+    void upload(const TensorUpload (&uploads)[N]) {
+        upload(uploads, N);
+    }
+};
+
+void LlamaContext::ModelUploader::finish() {
+    if (!m_semaphore.valid())
+        return;
+
+    m_semaphore.waitForever(m_numSubmits);
+    m_semaphore.reset();
+
+    ctx.vk.FreeCommandBuffers(ctx.device, m_commandPool,
+                              std::min(m_numSubmits, (uint64_t)2), m_commandBuffers);
+
+    memset(&m_commandBuffers, 0, sizeof(m_commandBuffers));
+    m_commandPool = nullptr;
+
+    m_uploadBuffer.reset();
+
+    m_parts.clear();
+    m_tensors.clear();
+    m_fileBuffer.clear();
+    m_numSubmits = 0;
+}
+
+// Open the model file(s) and scan them to find the tensor offsets.
+void LlamaContext::ModelUploader::openAndScan() {
+    size_t perFileBufferSize = 1024 * 1024;
+    m_fileBuffer.resize(ctx.m_fileInfo.n_parts * perFileBufferSize);
+
+    for (int i = 0; i < ctx.m_fileInfo.n_parts; ++i) {
+        std::string fname = ctx.m_modelPath;
+        if (i > 0) {
+            fname += "." + std::to_string(i);
+        }
+
+        m_parts.emplace_back(fname, std::ios::binary);
+        std::ifstream &fin = m_parts.back();
+        fin.rdbuf()->pubsetbuf(m_fileBuffer.data() + i * perFileBufferSize, perFileBufferSize);
+
+        fin.seekg(0, std::ios::end);
+        const size_t fileSize = fin.tellg();
+
+        fin.seekg(ctx.m_fileInfo.tensors_offset);
+
+#define CHECK(cond) \
+        do { \
+            if (!(cond)) { \
+                fprintf(stderr, "%s: broken model file %s: %s\n", __func__, fname.c_str(), #cond); \
+                exit(1); \
+            } \
+        } while (false)
+
+        for (;;) {
+            int32_t n_dims;
+            int32_t length;
+            int32_t ftype;
+
+            fin.read(reinterpret_cast<char *>(&n_dims), sizeof(n_dims));
+            fin.read(reinterpret_cast<char *>(&length), sizeof(length));
+            fin.read(reinterpret_cast<char *>(&ftype),  sizeof(ftype));
+
+            if (fin.eof())
+                break;
+
+            CHECK(n_dims <= 2);
+
+            int32_t nelements = 1;
+            int32_t ne[2] = { 1, 1 };
+            for (int i = 0; i < n_dims; ++i) {
+                fin.read(reinterpret_cast<char *>(&ne[i]), sizeof(ne[i]));
+                CHECK(ne[i] <= std::numeric_limits<int32_t>::max() / nelements);
+                nelements *= ne[i];
+            }
+
+            std::string name(length, 0);
+            fin.read(&name[0], length);
+
+            size_t offset = fin.tellg();
+
+            TensorOffsets &tensor = m_tensors[name];
+            if (tensor.offsets.empty()) {
+                tensor.ftype = ftype;
+                tensor.numDims = n_dims;
+                tensor.numElementsPerPart[0] = ne[0];
+                tensor.numElementsPerPart[1] = ne[1];
+
+                // split_type = columns:
+                // pattern:
+                //   - tok_embeddings.*
+                //   - layers.*.attention.wo.weight
+                //   - layers.*.feed_forward.w2.weight
+
+                // split_type = rows:
+                // pattern:
+                //   - output.*
+                //   - layers.*.attention.wq.weight
+                //   - layers.*.attention.wk.weight
+                //   - layers.*.attention.wv.weight
+                //   - layers.*.feed_forward.w1.weight
+                //   - layers.*.feed_forward.w3.weight
+                if (name.find("tok_embeddings") != std::string::npos) {
+                    tensor.splitType = SPLIT_PARTS_COLUMN;
+                } else if (name.find("layers") != std::string::npos) {
+                    if (name.find("attention.wo.weight") != std::string::npos) {
+                        tensor.splitType = SPLIT_PARTS_COLUMN;
+                    } else if (name.find("feed_forward.w2.weight") != std::string::npos) {
+                        tensor.splitType = SPLIT_PARTS_COLUMN;
+                    } else {
+                        tensor.splitType = SPLIT_PARTS_ROW;
+                    }
+                } else if (name.find("output") != std::string::npos) {
+                    tensor.splitType = SPLIT_PARTS_ROW;
+                }
+            } else {
+                CHECK(ftype == tensor.ftype);
+                CHECK(tensor.numDims == n_dims);
+                CHECK(tensor.numElementsPerPart[0] == ne[0]);
+                CHECK(tensor.numElementsPerPart[1] == ne[1]);
+            }
+
+            tensor.offsets.resize(ctx.m_fileInfo.n_parts);
+            CHECK(!tensor.offsets[i]);
+            tensor.offsets[i] = offset;
+
+            size_t tensorSize;
+            switch (ftype) {
+            case FTYPE_F32: tensorSize = 4 * size_t(nelements); break;
+            case FTYPE_F16: tensorSize = 2 * size_t(nelements); break;
+            case FTYPE_Q4_0:
+                CHECK(ne[0] % 64 == 0); // File format block size is 32, but the GPU swizzle wants 64
+                tensorSize = (4 + 16) * size_t(nelements / 32);
+                break;
+            case FTYPE_Q4_1:
+                CHECK(ne[0] % 64 == 0); // File format block size is 32, but the GPU swizzle wants 64
+                tensorSize = (2 * 4 + 16) * size_t(nelements / 32);
+                break;
+            default:
+                CHECK(!"bad ftype");
+                break;
+            }
+
+            CHECK(offset + tensorSize <= fileSize);
+            fin.seekg(tensorSize, std::ios::cur);
+        }
+
+#undef CHECK
+    }
+
+    for (const auto &entry : m_tensors) {
+        for (auto offset : entry.second.offsets) {
+            if (!offset) {
+                fprintf(stderr, "%s: missing part of tensor '%s'\n", __func__, entry.first.c_str());
+                exit(1);
+            }
+        }
+    }
+}
+
+void LlamaContext::ModelUploader::lazyInit() {
+    if (m_semaphore.valid()) {
+        assert(m_uploadBuffer.valid());
+        return;
+    }
+
+    assert(!m_uploadBuffer.valid());
+
+    m_semaphore = ctx.device.createTimelineSemaphore();
+
+    size_t firstUploadSize = alignPot(ctx.m_globalOffsets.embedding.range, 256);
+    size_t layerUploadSize =
+        alignPot(ctx.m_layerOffsets.attentionNorm.range, 256) +
+        alignPot(ctx.m_layerOffsets.Wq.range, 256) +
+        alignPot(ctx.m_layerOffsets.Wk.range, 256) +
+        alignPot(ctx.m_layerOffsets.Wv.range, 256) +
+        alignPot(ctx.m_layerOffsets.Wo.range, 256) +
+        alignPot(ctx.m_layerOffsets.ffnNorm.range, 256) +
+        alignPot(ctx.m_layerOffsets.W1.range, 256) +
+        alignPot(ctx.m_layerOffsets.W2.range, 256) +
+        alignPot(ctx.m_layerOffsets.W3.range, 256);
+
+    m_maxUploadSize = std::max(firstUploadSize, layerUploadSize);
+
+    size_t uploadBufferSize = 2 * m_maxUploadSize;
+    m_uploadBuffer = ctx.device.allocateHost(uploadBufferSize);
+
+    m_commandPool = ctx.m_transferCommandPool;
+    if (!m_commandPool)
+        m_commandPool = ctx.m_computeCommandPool;
+}
+
+void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t numUploads) {
+    lazyInit();
+
+    // Wait for the second-to-last submit to complete. This protects against
+    // a WAR hazard when writing to our host-side upload buffer and re-using
+    // the command buffer.
+    if (m_numSubmits >= 2)
+        m_semaphore.waitForever(m_numSubmits - 1);
+
+    // Step 1: Allocate the upload command buffer
+    VkCommandBuffer cmdBuf;
+    {
+        if (m_numSubmits < 2) {
+            VkCommandBufferAllocateInfo allocateInfo = {};
+            allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            allocateInfo.commandPool = m_commandPool;
+            allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocateInfo.commandBufferCount = 1;
+
+            LLVK_CHECK_RESULT(ctx.vk.AllocateCommandBuffers(ctx.device, &allocateInfo, &cmdBuf));
+            m_commandBuffers[m_numSubmits] = cmdBuf;
+        } else {
+            // The wait above ensured that the old command buffer is idle, and
+            // vkBeginCommandBuffer resets it implicitly.
+            cmdBuf = m_commandBuffers[m_numSubmits % 2];
+        }
+
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        LLVK_CHECK_RESULT(ctx.vk.BeginCommandBuffer(cmdBuf, &beginInfo));
+
+        VkMemoryBarrier2 readFromHostBarrier = {};
+        readFromHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        readFromHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        readFromHostBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT;
+        readFromHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        readFromHostBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
+
+        VkDependencyInfo dependencyInfo = {};
+        dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dependencyInfo.memoryBarrierCount = 1;
+        dependencyInfo.pMemoryBarriers = &readFromHostBarrier;
+        ctx.vk.CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
+    }
+
+    size_t base = (m_numSubmits % 2) * m_maxUploadSize;
+    size_t uploadOffset = 0;
+
+    // Step 2: Read from file(s), write to upload buffer, and build upload command buffer
+    {
+        void *buffer = m_uploadBuffer.map(base, m_maxUploadSize);
+        VkBuffer currentDstBuffer = nullptr;
+        std::vector<VkBufferCopy> copyRegions;
+        std::vector<VkBufferMemoryBarrier2> queueReleases;
+        std::vector<char> convertBuffer;
+        auto flushCopies = [&]() {
+            if (!currentDstBuffer)
+                return;
+
+            ctx.vk.CmdCopyBuffer(cmdBuf, m_uploadBuffer.buffer(), currentDstBuffer,
+                                 copyRegions.size(), copyRegions.data());
+
+            if (ctx.device.haveTransferQueue() && ctx.device.transferQueueFamily() != ctx.device.computeQueueFamily()) {
+                bool isFirst = true;
+                for (const VkBufferCopy &region : copyRegions) {
+                    if (!isFirst) {
+                        auto &prev = queueReleases.back();
+                        if (prev.buffer == currentDstBuffer &&
+                            alignPot(prev.offset + prev.size, 256) == region.dstOffset)
+                        {
+                            prev.size += region.size;
+                            continue;
+                        }
+                    }
+                    isFirst = false;
+
+                    VkBufferMemoryBarrier2 queueReleaseBarrier = {};
+                    queueReleaseBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+                    queueReleaseBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                    queueReleaseBarrier.srcAccessMask = 0;
+                    queueReleaseBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                    queueReleaseBarrier.dstAccessMask = 0;
+                    queueReleaseBarrier.srcQueueFamilyIndex = ctx.device.transferQueueFamily();
+                    queueReleaseBarrier.dstQueueFamilyIndex = ctx.device.computeQueueFamily();
+                    queueReleaseBarrier.buffer = currentDstBuffer;
+                    queueReleaseBarrier.offset = region.dstOffset;
+                    queueReleaseBarrier.size = region.size;
+                    queueReleases.push_back(queueReleaseBarrier);
+                }
+
+                // VkDependencyInfo dependencyInfo = {};
+                // dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+
+                // ctx.vk.CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
+            }
+
+            currentDstBuffer = nullptr;
+            copyRegions.clear();
+        };
+
+        for (unsigned idx = 0; idx < numUploads; ++idx) {
+            const TensorUpload &upload = uploads[idx];
+            assert(uploadOffset + upload.range.range <= m_maxUploadSize);
+
+            auto tensorIt = m_tensors.find(upload.name);
+            if (tensorIt == m_tensors.end()) {
+                fprintf(stderr, "%s: missing tensor '%s'\n", __func__, upload.name.c_str());
+                exit(1);
+            }
+            const TensorOffsets &tensor = tensorIt->second;
+
+            // Per-tensor sanity checks
+            const char *typeCheckFail = nullptr;
+            switch (upload.vktype) {
+            case VKTYPE_F16:
+                if (tensor.ftype != FTYPE_F32 && tensor.ftype != FTYPE_F16)
+                    typeCheckFail = "f16";
+                break;
+            case VKTYPE_Q4_0:
+                if (tensor.ftype != FTYPE_Q4_0)
+                    typeCheckFail = "q4_0";
+                break;
+            default:
+                typeCheckFail = "unknown";
+                break;
+            }
+            if (typeCheckFail) {
+                fprintf(stderr, "%s: upload '%s' as %s, but ftype is %u\n",
+                        __func__, upload.name.c_str(), typeCheckFail, tensor.ftype);
+                exit(1);
+            }
+
+            int32_t fullTensorElements[2] = { tensor.numElementsPerPart[0], tensor.numElementsPerPart[1] };
+
+            if (tensor.numDims == 2) {
+                if (tensor.splitType == SPLIT_PARTS_COLUMN) {
+                    fullTensorElements[0] *= m_parts.size();
+                } else {
+                    fullTensorElements[1] *= m_parts.size();
+                }
+            }
+
+            if (fullTensorElements[0] != upload.numElements[0] ||
+                fullTensorElements[1] != upload.numElements[1])
+            {
+                fprintf(stderr, "%s: tensor '%s' has size %dx%x (per part: %dx%d), expect %dx%d\n",
+                        __func__, upload.name.c_str(),
+                        fullTensorElements[0], fullTensorElements[1],
+                        tensor.numElementsPerPart[0], tensor.numElementsPerPart[1],
+                        upload.numElements[0], upload.numElements[1]);
+                exit(1);
+            }
+
+            // Load from file and copy/swizzle to upload buffer.
+            size_t tensorParts = tensor.numDims == 2 ? m_parts.size() : 1;
+            size_t srcRowBytes = ftypeSize(tensor.ftype, tensor.numElementsPerPart[0], 1);
+
+            assert(vktypeSize(upload.vktype, fullTensorElements[0], fullTensorElements[1]) <= upload.range.range);
+
+            if ((upload.vktype == VKTYPE_F16 && tensor.ftype == FTYPE_F32) ||
+                (upload.vktype == VKTYPE_Q4_0)) {
+                convertBuffer.resize(srcRowBytes);
+            }
+
+            char * __restrict__ cbuf = convertBuffer.data();
+
+            for (unsigned part = 0; part < tensorParts; ++part) {
+                auto &fin = m_parts[part];
+                fin.seekg(tensor.offsets[part], std::ios::beg);
+
+                if (upload.vktype == VKTYPE_Q4_0) {
+                    assert(tensor.numElementsPerPart[0] % 64 == 0);
+                    size_t nDoubleBlocks = size_t(fullTensorElements[0] / 64);
+                    size_t dstScaleBytes = 4 * nDoubleBlocks * fullTensorElements[1];
+                    size_t dstWeightsBytes = 32 * nDoubleBlocks * fullTensorElements[1];
+                    char * __restrict__ tensorUploadScales = (char *)buffer + uploadOffset;
+                    char * __restrict__ tensorUploadWeights = (char *)buffer + uploadOffset + dstScaleBytes;
+                    size_t scaleStride = 4 * fullTensorElements[1];
+                    size_t weightsStride = 32 * fullTensorElements[1];
+
+                    if (tensor.splitType == SPLIT_PARTS_COLUMN) {
+                        tensorUploadScales += part * dstScaleBytes / tensorParts;
+                        tensorUploadWeights += part * dstWeightsBytes / tensorParts;
+                    } else {
+                        tensorUploadScales += part * 4 * fullTensorElements[1] / tensorParts;
+                        tensorUploadWeights += part * 32 * fullTensorElements[1] / tensorParts;
+                    }
+
+                    for (unsigned row = 0; row < tensor.numElementsPerPart[1]; ++row) {
+                        fin.read(cbuf, srcRowBytes);
+
+                        for (unsigned block = 0; block < nDoubleBlocks / tensorParts; ++block) {
+                            *(_Float16 *)(tensorUploadScales + 4 * row + block * scaleStride + 0) = *(float *)(cbuf + block * 40 + 0);
+                            *(_Float16 *)(tensorUploadScales + 4 * row + block * scaleStride + 2) = *(float *)(cbuf + block * 40 + 20);
+                            memcpy(tensorUploadWeights + 32 * row + block * weightsStride +  0, cbuf + block * 40 +  4, 16);
+                            memcpy(tensorUploadWeights + 32 * row + block * weightsStride + 16, cbuf + block * 40 + 24, 16);
+                        }
+                    }
+                } else {
+                    char * __restrict__ tensorUpload = (char *)buffer + uploadOffset;
+                    size_t dstRowBytes = vktypeSize(upload.vktype, fullTensorElements[0], 1);
+                    if (tensor.splitType == SPLIT_PARTS_COLUMN) {
+                        tensorUpload += part * (dstRowBytes / tensorParts);
+                    } else {
+                        tensorUpload += part * dstRowBytes * (fullTensorElements[1] / tensorParts);
+                    }
+
+                    assert(upload.vktype == VKTYPE_F16);
+
+                    switch (tensor.ftype) {
+                    case FTYPE_F16:
+                        for (unsigned row = 0; row < tensor.numElementsPerPart[1]; ++row) {
+                            char *rowUpload = tensorUpload + row * dstRowBytes;
+                            fin.read(rowUpload, srcRowBytes);
+                        }
+                        break;
+                    case FTYPE_F32:
+                        for (unsigned row = 0; row < tensor.numElementsPerPart[1]; ++row) {
+                            fin.read(cbuf, srcRowBytes);
+                            for (unsigned col = 0; col < tensor.numElementsPerPart[0]; ++col) {
+                                *(_Float16 *)(tensorUpload + row * dstRowBytes + 2 * col) = *(float *)(cbuf + 4 * col);
+                            }
+                        }
+                        break;
+                    default:
+                        abort();
+                    }
+                }
+            }
+
+            // Setup the copy command.
+            if (currentDstBuffer && currentDstBuffer != upload.buffer)
+                flushCopies();
+            currentDstBuffer = upload.buffer;
+
+            VkBufferCopy region;
+            region.srcOffset = base + uploadOffset;
+            region.dstOffset = upload.range.offset;
+            region.size = upload.range.range;
+            copyRegions.push_back(region);
+
+            uploadOffset += alignPot(upload.range.range, 256);
+        }
+
+        flushCopies();
+
+        m_uploadBuffer.unmap();
+
+        VkDependencyInfo dependencyInfo = {};
+        dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dependencyInfo.bufferMemoryBarrierCount = queueReleases.size();
+        dependencyInfo.pBufferMemoryBarriers = queueReleases.data();
+        ctx.vk.CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
+
+        LLVK_CHECK_RESULT(ctx.vk.EndCommandBuffer(cmdBuf));
+    }
+
+    // Step 3: Submit the upload command buffer
+    m_numSubmits++;
+
+    VkQueue queue = ctx.device.haveTransferQueue() ? ctx.device.transferQueue() : ctx.device.computeQueue();
+
+    VkCommandBufferSubmitInfo commandBufferSubmitInfo = {};
+    commandBufferSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    commandBufferSubmitInfo.commandBuffer = cmdBuf;
+
+    VkSemaphoreSubmitInfo semaphoreSubmitInfo = {};
+    semaphoreSubmitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    semaphoreSubmitInfo.semaphore = m_semaphore.semaphore();
+    semaphoreSubmitInfo.value = m_numSubmits;
+    semaphoreSubmitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkSubmitInfo2 submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &commandBufferSubmitInfo;
+    submitInfo.signalSemaphoreInfoCount = 1;
+    submitInfo.pSignalSemaphoreInfos = &semaphoreSubmitInfo;
+
+    LLVK_CHECK_RESULT(ctx.vk.QueueSubmit2(queue, 1, &submitInfo, nullptr));
+}
+
+void LlamaContext::uploadModel() {
+    fprintf(stderr, "llama-vk: uploading");
+    fflush(stderr);
+
+    ModelUploader uploader(*this);
+    uploader.openAndScan();
+
+    // Upload tensors.
+    //
+    // PCIe is relatively slow, so pipeline the upload.
+    //
+    // Swizzling is currently done on the CPU. There's space for experimentation
+    // about what strategy is best with batched prompt processing: async compute
+    // fetching directly from mmap()'d buffers via VK_EXT_external_memory_host,
+    // in parallel with prompt processing, would be interesting.
+    {
+        TensorUpload uploads[] = {
+            {"tok_embeddings.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_numVocab,
+             m_globalMemory.buffer(), m_globalOffsets.embedding},
+        };
+        uploader.upload(uploads);
+        fprintf(stderr, ".");
+        fflush(stderr);
+    }
+
+    for (unsigned layer = 0; layer < m_numLayers; ++layer) {
+        TensorUpload uploads[] = {
+            {"layers." + std::to_string(layer) + ".attention_norm.weight", VKTYPE_F16, m_specData.nEmbd, 1,
+             m_layerMemory[layer].buffer(), m_layerOffsets.attentionNorm},
+            {"layers." + std::to_string(layer) + ".attention.wq.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+             m_layerMemory[layer].buffer(), m_layerOffsets.Wq},
+            {"layers." + std::to_string(layer) + ".attention.wk.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+             m_layerMemory[layer].buffer(), m_layerOffsets.Wk},
+            {"layers." + std::to_string(layer) + ".attention.wv.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+             m_layerMemory[layer].buffer(), m_layerOffsets.Wv},
+            {"layers." + std::to_string(layer) + ".attention.wo.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+             m_layerMemory[layer].buffer(), m_layerOffsets.Wo},
+            {"layers." + std::to_string(layer) + ".ffn_norm.weight", VKTYPE_F16, m_specData.nEmbd, 1,
+             m_layerMemory[layer].buffer(), m_layerOffsets.ffnNorm},
+            {"layers." + std::to_string(layer) + ".feed_forward.w1.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF,
+             m_layerMemory[layer].buffer(), m_layerOffsets.W1},
+            {"layers." + std::to_string(layer) + ".feed_forward.w2.weight", VKTYPE_Q4_0, m_specData.nFF, m_specData.nEmbd,
+             m_layerMemory[layer].buffer(), m_layerOffsets.W2},
+            {"layers." + std::to_string(layer) + ".feed_forward.w3.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF,
+             m_layerMemory[layer].buffer(), m_layerOffsets.W3},
+        };
+        uploader.upload(uploads);
+        fprintf(stderr, ".");
+        fflush(stderr);
+    }
+
+    uploader.finish();
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 } // namespace llvk
@@ -1298,6 +2092,8 @@ int main(int argc, char **argv) {
         exit(1);
 
     llvk::LlamaContext vkctx(vk, device, params.model, model_file_info, 2048);
+
+    vkctx.uploadModel();
 
     // Add a space in front of the first character to match OG llama tokenizer behavior
     params.prompt.insert(0, 1, ' ');
