@@ -20,6 +20,8 @@ models/*
 /quantize
 /result
 /perplexity
+/llama-vk
+/vulkan/*.spv
 
 arm_neon.h
 compile_commands.json
