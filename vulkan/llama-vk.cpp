@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -66,9 +67,33 @@ public:
 
     operator VkInstance() { return theInstance; }
 
+    void utilCmdPipelineMemoryBarrier(
+            VkCommandBuffer cmdBuf,
+            VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+            VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask);
+
 #define FN(name) PFN_vk ## name name = nullptr;
 #include "llama-vk-functions.inc"
 };
+
+void Instance::utilCmdPipelineMemoryBarrier(
+        VkCommandBuffer cmdBuf,
+        VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+        VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask) {
+    VkMemoryBarrier2 memoryBarrier = {};
+    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    memoryBarrier.srcStageMask = srcStageMask;
+    memoryBarrier.srcAccessMask = srcAccessMask;
+    memoryBarrier.dstStageMask = dstStageMask;
+    memoryBarrier.dstAccessMask = dstAccessMask;
+
+    VkDependencyInfo dependencyInfo = {};
+    dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependencyInfo.memoryBarrierCount = 1;
+    dependencyInfo.pMemoryBarriers = &memoryBarrier;
+
+    CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
+}
 
 class OwnedInstance : public Instance {
 public:
@@ -136,6 +161,7 @@ OwnedInstance OwnedInstance::createDefault() {
     static const std::array validationFeatureEnables{
         VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
         VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+        VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT,
     };
     VkValidationFeaturesEXT validationFeatures = {};
     validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
@@ -146,7 +172,7 @@ OwnedInstance OwnedInstance::createDefault() {
         "VK_LAYER_KHRONOS_validation",
     };
     static const std::array instanceExtensions{
-        "VK_EXT_validation_features",
+        VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME,
     };
 
     VkInstanceCreateInfo createInfo = {};
@@ -443,8 +469,8 @@ MemoryAndBuffer &MemoryAndBuffer::operator=(MemoryAndBuffer &&rhs) {
 void MemoryAndBuffer::reset() {
     if (m_buffer) {
         auto &vk = m_device->instance();
-        vk.FreeMemory(*m_device, m_memory, nullptr);
         vk.DestroyBuffer(*m_device, m_buffer, nullptr);
+        vk.FreeMemory(*m_device, m_memory, nullptr);
 
         m_buffer = nullptr;
         m_memory = nullptr;
@@ -894,17 +920,18 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
 // Tensor types on the GPU
 enum {
     VKTYPE_F16 = 0,
-    VKTYPE_Q4_0 = 1,
+    VKTYPE_Q4_0_SWZ = 1,
+    VKTYPE_Q4_0_LINEAR = 2,
 };
 
 uint64_t vktypeSize(int32_t vktype, uint64_t ne0, uint64_t ne1) {
     switch (vktype) {
     case VKTYPE_F16:
         return 2 * ne0 * ne1;
-    case VKTYPE_Q4_0: {
+    case VKTYPE_Q4_0_SWZ:
+    case VKTYPE_Q4_0_LINEAR:
         assert((ne0 % 64) == 0);
         return (4 + 32) * (ne0 / 64) * ne1;
-    }
     }
     abort();
 }
@@ -913,18 +940,21 @@ struct SpecConstants {
     uint nEmbd = 6656;
     uint nCtx = 2048;
     uint nFF = 17920;
+    uint nVocab = 32000;
     float rotaryTheta = 10000.0;
 };
 static const VkSpecializationMapEntry g_specMapEntries[] = {
     { 0, offsetof(SpecConstants, nEmbd), sizeof(SpecConstants::nEmbd) },
     { 1, offsetof(SpecConstants, nCtx), sizeof(SpecConstants::nCtx) },
     { 2, offsetof(SpecConstants, nFF), sizeof(SpecConstants::nFF) },
-    { 3, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
+    { 3, offsetof(SpecConstants, nVocab), sizeof(SpecConstants::nVocab) },
+    { 4, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutGlobal[] = {
     { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // constants
     { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // history indices
+    { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // embedding weights
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutPerKernel[] = {
@@ -951,6 +981,8 @@ public:
 
     void uploadModel();
 
+    void process(const llama_token *token, size_t numTokens);
+
 private:
     VkDescriptorSetLayout createDescriptorSetLayoutImpl(const VkDescriptorSetLayoutBinding *bindings, size_t count);
     template <int N>
@@ -968,6 +1000,7 @@ private:
     unsigned m_maxCacheEntries;
 
     VkPipeline m_kernelThinFp16Attention = nullptr;
+    VkPipeline m_kernelThinFp16FirstRmsNorm = nullptr;
     VkPipeline m_kernelThinFp16RmsNorm = nullptr;
 
     VkPipelineLayout m_pipelineLayout = nullptr;
@@ -1007,6 +1040,10 @@ private:
     } m_layerOffsets;
     std::vector<MemoryAndBuffer> m_layerMemory;
 
+    struct {
+        uint64_t size = 0;
+        Range debugActivations;
+    } m_hostOffsets;
     MemoryAndBuffer m_hostMemory;
 
     std::string m_modelPath;
@@ -1017,6 +1054,14 @@ private:
 
     VkCommandPool m_computeCommandPool = nullptr;
     VkCommandPool m_transferCommandPool = nullptr;
+
+    TimelineSemaphore m_semaphore;
+    uint64_t m_numSubmits = 0;
+    unsigned m_numPasses = 0;
+
+    VkCommandBuffer m_commandBuffers[2] = {};
+
+    std::unique_ptr<ModelUploader> m_uploader;
 };
 
 LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
@@ -1051,6 +1096,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     pipelineLayoutCreateInfo.pSetLayouts = setLayouts;
     LLVK_CHECK_RESULT(vk.CreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout));
 
+    m_kernelThinFp16FirstRmsNorm = createPipeline("KernelThinFp16FirstRmsNorm");
     m_kernelThinFp16RmsNorm = createPipeline("KernelThinFp16RmsNorm");
     m_kernelThinFp16Attention = createPipeline("KernelThinFp16Attention");
 
@@ -1068,7 +1114,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
         OFFSET(m_layerOffsets, attentionNorm, 2 * m_specData.nEmbd);
 
-        uint64_t attnMatrixSize = vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd);
+        uint64_t attnMatrixSize = vktypeSize(VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nEmbd);
         OFFSET(m_layerOffsets, Wq, attnMatrixSize);
         OFFSET(m_layerOffsets, Wk, attnMatrixSize);
         OFFSET(m_layerOffsets, Wv, attnMatrixSize);
@@ -1076,9 +1122,9 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
         OFFSET(m_layerOffsets, ffnNorm, 2 * m_specData.nEmbd);
 
-        OFFSET(m_layerOffsets, W1, vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF));
-        OFFSET(m_layerOffsets, W2, vktypeSize(VKTYPE_Q4_0, m_specData.nFF, m_specData.nEmbd));
-        OFFSET(m_layerOffsets, W3, vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF));
+        OFFSET(m_layerOffsets, W1, vktypeSize(VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nFF));
+        OFFSET(m_layerOffsets, W2, vktypeSize(VKTYPE_Q4_0_SWZ, m_specData.nFF, m_specData.nEmbd));
+        OFFSET(m_layerOffsets, W3, vktypeSize(VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nFF));
 
         uint64_t cacheSize = 2 * m_specData.nEmbd * m_maxCacheEntries;
         OFFSET(m_layerOffsets, cacheKeys, cacheSize);
@@ -1088,7 +1134,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
         OFFSET(m_globalOffsets, constants[1], sizeof(shader::GlobalConstantBuffer));
         OFFSET(m_globalOffsets, historyIndex, 2 * 2048);
 
-        uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0, m_specData.nEmbd, m_numVocab);
+        uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_numVocab);
         OFFSET(m_globalOffsets, embedding, embdMatrixSize);
 
         uint64_t activationSize = 2 * m_specData.nEmbd;
@@ -1109,6 +1155,11 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
                 exit(1);
             m_layerMemory.push_back(std::move(memory));
         }
+
+        OFFSET(m_hostOffsets, debugActivations, activationSize);
+        m_hostMemory = device.allocateHost(m_hostOffsets.size);
+        if (!m_hostMemory.valid())
+            exit(1);
     }
 
     // Step 3: Set up descriptor sets
@@ -1125,7 +1176,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
             {
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     (uint32_t)(
-                        globalSets * 1
+                        globalSets * 2
                         + layerSets * sizeof(g_dsetLayoutPerLayer) / sizeof(g_dsetLayoutPerLayer[0])
                         + kernelSets * sizeof(g_dsetLayoutPerKernel) / sizeof(g_dsetLayoutPerKernel[0])
                     ),
@@ -1148,6 +1199,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
         for (unsigned i = 0; i < globalSets; ++i) {
             write.writeUniform(m_dsetGlobal[i], 0, m_globalMemory.buffer(), m_globalOffsets.constants[i]);
             write.writeStorage(m_dsetGlobal[i], 1, m_globalMemory.buffer(), m_globalOffsets.historyIndex);
+            write.writeStorage(m_dsetGlobal[i], 2, m_globalMemory.buffer(), m_globalOffsets.embedding);
         }
 
         for (unsigned i = 0; i < kernelSets; ++i) {
@@ -1172,6 +1224,8 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     m_computeCommandPool = device.createCommandPool(false);
     if (device.haveTransferQueue())
         m_transferCommandPool = device.createCommandPool(true);
+
+    m_semaphore = device.createTimelineSemaphore();
 }
 
 LlamaContext::~LlamaContext() {
@@ -1179,6 +1233,11 @@ LlamaContext::~LlamaContext() {
 }
 
 void LlamaContext::destroy() {
+    m_semaphore.waitForever(m_numSubmits);
+
+    vk.FreeCommandBuffers(device, m_computeCommandPool, std::min<uint64_t>(m_numSubmits, 2), m_commandBuffers);
+    memset(&m_commandBuffers, 0, sizeof(m_commandBuffers));
+
 #define DESTROY(name) \
     do { \
         if (name) { \
@@ -1224,6 +1283,7 @@ void LlamaContext::destroy() {
     } while(false)
 
     DESTROY(m_kernelThinFp16Attention);
+    DESTROY(m_kernelThinFp16FirstRmsNorm);
     DESTROY(m_kernelThinFp16RmsNorm);
 
 #undef DESTROY
@@ -1343,6 +1403,7 @@ struct LlamaContext::ModelUploader {
     MemoryAndBuffer m_uploadBuffer;
     VkCommandPool m_commandPool = nullptr;
     VkCommandBuffer m_commandBuffers[2] = {};
+    std::vector<VkBufferMemoryBarrier2> m_queueTransfers;
 
     ModelUploader(LlamaContext &ctx) : ctx(ctx) {}
     ~ModelUploader() { finish(); }
@@ -1415,9 +1476,6 @@ void LlamaContext::ModelUploader::openAndScan() {
             fin.read(reinterpret_cast<char *>(&n_dims), sizeof(n_dims));
             fin.read(reinterpret_cast<char *>(&length), sizeof(length));
             fin.read(reinterpret_cast<char *>(&ftype),  sizeof(ftype));
-
-            if (fin.eof())
-                break;
 
             CHECK(n_dims <= 2);
 
@@ -1498,6 +1556,13 @@ void LlamaContext::ModelUploader::openAndScan() {
 
             CHECK(offset + tensorSize <= fileSize);
             fin.seekg(tensorSize, std::ios::cur);
+            if (!fin) {
+                fprintf(stderr, "%s: seek past tensor failed\n", __func__);
+                exit(1);
+            }
+
+            if (offset + tensorSize >= fileSize)
+                break;
         }
 
 #undef CHECK
@@ -1577,20 +1642,13 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         LLVK_CHECK_RESULT(ctx.vk.BeginCommandBuffer(cmdBuf, &beginInfo));
 
-        VkMemoryBarrier2 readFromHostBarrier = {};
-        readFromHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        readFromHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
-        readFromHostBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT;
-        readFromHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        readFromHostBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
-
-        VkDependencyInfo dependencyInfo = {};
-        dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dependencyInfo.memoryBarrierCount = 1;
-        dependencyInfo.pMemoryBarriers = &readFromHostBarrier;
-        ctx.vk.CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
+        ctx.vk.utilCmdPipelineMemoryBarrier(
+                cmdBuf,
+                VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
     }
 
+    size_t beginQueueTransfers = m_queueTransfers.size();
     size_t base = (m_numSubmits % 2) * m_maxUploadSize;
     size_t uploadOffset = 0;
 
@@ -1599,7 +1657,6 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
         void *buffer = m_uploadBuffer.map(base, m_maxUploadSize);
         VkBuffer currentDstBuffer = nullptr;
         std::vector<VkBufferCopy> copyRegions;
-        std::vector<VkBufferMemoryBarrier2> queueReleases;
         std::vector<char> convertBuffer;
         auto flushCopies = [&]() {
             if (!currentDstBuffer)
@@ -1612,7 +1669,7 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                 bool isFirst = true;
                 for (const VkBufferCopy &region : copyRegions) {
                     if (!isFirst) {
-                        auto &prev = queueReleases.back();
+                        auto &prev = m_queueTransfers.back();
                         if (prev.buffer == currentDstBuffer &&
                             alignPot(prev.offset + prev.size, 256) == region.dstOffset)
                         {
@@ -1622,18 +1679,18 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                     }
                     isFirst = false;
 
-                    VkBufferMemoryBarrier2 queueReleaseBarrier = {};
-                    queueReleaseBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
-                    queueReleaseBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-                    queueReleaseBarrier.srcAccessMask = 0;
-                    queueReleaseBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-                    queueReleaseBarrier.dstAccessMask = 0;
-                    queueReleaseBarrier.srcQueueFamilyIndex = ctx.device.transferQueueFamily();
-                    queueReleaseBarrier.dstQueueFamilyIndex = ctx.device.computeQueueFamily();
-                    queueReleaseBarrier.buffer = currentDstBuffer;
-                    queueReleaseBarrier.offset = region.dstOffset;
-                    queueReleaseBarrier.size = region.size;
-                    queueReleases.push_back(queueReleaseBarrier);
+                    VkBufferMemoryBarrier2 queueTransfer = {};
+                    queueTransfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+                    queueTransfer.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                    queueTransfer.srcAccessMask = 0;
+                    queueTransfer.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                    queueTransfer.dstAccessMask = 0;
+                    queueTransfer.srcQueueFamilyIndex = ctx.device.transferQueueFamily();
+                    queueTransfer.dstQueueFamilyIndex = ctx.device.computeQueueFamily();
+                    queueTransfer.buffer = currentDstBuffer;
+                    queueTransfer.offset = region.dstOffset;
+                    queueTransfer.size = region.size;
+                    m_queueTransfers.push_back(queueTransfer);
                 }
 
                 // VkDependencyInfo dependencyInfo = {};
@@ -1664,7 +1721,8 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                 if (tensor.ftype != FTYPE_F32 && tensor.ftype != FTYPE_F16)
                     typeCheckFail = "f16";
                 break;
-            case VKTYPE_Q4_0:
+            case VKTYPE_Q4_0_SWZ:
+            case VKTYPE_Q4_0_LINEAR:
                 if (tensor.ftype != FTYPE_Q4_0)
                     typeCheckFail = "q4_0";
                 break;
@@ -1706,7 +1764,7 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
             assert(vktypeSize(upload.vktype, fullTensorElements[0], fullTensorElements[1]) <= upload.range.range);
 
             if ((upload.vktype == VKTYPE_F16 && tensor.ftype == FTYPE_F32) ||
-                (upload.vktype == VKTYPE_Q4_0)) {
+                upload.vktype == VKTYPE_Q4_0_SWZ || upload.vktype == VKTYPE_Q4_0_LINEAR) {
                 convertBuffer.resize(srcRowBytes);
             }
 
@@ -1716,15 +1774,29 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                 auto &fin = m_parts[part];
                 fin.seekg(tensor.offsets[part], std::ios::beg);
 
-                if (upload.vktype == VKTYPE_Q4_0) {
+                if (upload.vktype == VKTYPE_Q4_0_SWZ || upload.vktype == VKTYPE_Q4_0_LINEAR) {
                     assert(tensor.numElementsPerPart[0] % 64 == 0);
                     size_t nDoubleBlocks = size_t(fullTensorElements[0] / 64);
                     size_t dstScaleBytes = 4 * nDoubleBlocks * fullTensorElements[1];
                     size_t dstWeightsBytes = 32 * nDoubleBlocks * fullTensorElements[1];
                     char * __restrict__ tensorUploadScales = (char *)buffer + uploadOffset;
                     char * __restrict__ tensorUploadWeights = (char *)buffer + uploadOffset + dstScaleBytes;
-                    size_t scaleStride = 4 * fullTensorElements[1];
-                    size_t weightsStride = 32 * fullTensorElements[1];
+                    size_t scaleRowStride;
+                    size_t weightsRowStride;
+                    size_t scaleBlockStride;
+                    size_t weightsBlockStride;
+
+                    if (upload.vktype == VKTYPE_Q4_0_SWZ) {
+                        scaleRowStride = 4;
+                        weightsRowStride = 32;
+                        scaleBlockStride = 4 * fullTensorElements[1];
+                        weightsBlockStride = 32 * fullTensorElements[1];
+                    } else {
+                        scaleRowStride = 4 * nDoubleBlocks;
+                        weightsRowStride = 32 * nDoubleBlocks;
+                        scaleBlockStride = 4;
+                        weightsBlockStride = 32;
+                    }
 
                     if (tensor.splitType == SPLIT_PARTS_COLUMN) {
                         tensorUploadScales += part * dstScaleBytes / tensorParts;
@@ -1738,10 +1810,25 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                         fin.read(cbuf, srcRowBytes);
 
                         for (unsigned block = 0; block < nDoubleBlocks / tensorParts; ++block) {
-                            *(_Float16 *)(tensorUploadScales + 4 * row + block * scaleStride + 0) = *(float *)(cbuf + block * 40 + 0);
-                            *(_Float16 *)(tensorUploadScales + 4 * row + block * scaleStride + 2) = *(float *)(cbuf + block * 40 + 20);
-                            memcpy(tensorUploadWeights + 32 * row + block * weightsStride +  0, cbuf + block * 40 +  4, 16);
-                            memcpy(tensorUploadWeights + 32 * row + block * weightsStride + 16, cbuf + block * 40 + 24, 16);
+                            size_t scaleOffset = row * scaleRowStride + block * scaleBlockStride;
+                            size_t weightsOffset = row * weightsRowStride + block * weightsBlockStride;
+                            *(_Float16 *)(tensorUploadScales + scaleOffset + 0) = *(float *)(cbuf + block * 40 + 0);
+                            *(_Float16 *)(tensorUploadScales + scaleOffset + 2) = *(float *)(cbuf + block * 40 + 20);
+                            memcpy(tensorUploadWeights + weightsOffset +  0, cbuf + block * 40 + 4, 16);
+                            memcpy(tensorUploadWeights + weightsOffset + 16, cbuf + block * 40 + 24, 16);
+
+                            if (row == 1 && block < 2) {
+                                if (upload.name == "tok_embeddings.weight") {
+                                    printf("Upload %s, part %u row %u block %u\n", upload.name.c_str(), part, row, block);
+                                    printf("  scales: %f %08x %f %08x\n",
+                                        *(float *)(cbuf + block * 40 + 0), *(int *)(cbuf + block * 40 + 0),
+                                        *(float *)(cbuf + block * 40 + 20), *(int *)(cbuf + block * 40 + 20));
+                                    printf("  converted: %08x\n", *(int *)(tensorUploadScales + scaleOffset));
+                                    int *w = (int *)(tensorUploadWeights + weightsOffset);
+                                    printf("  weights: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1796,8 +1883,8 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
 
         VkDependencyInfo dependencyInfo = {};
         dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dependencyInfo.bufferMemoryBarrierCount = queueReleases.size();
-        dependencyInfo.pBufferMemoryBarriers = queueReleases.data();
+        dependencyInfo.bufferMemoryBarrierCount = m_queueTransfers.size() - beginQueueTransfers;
+        dependencyInfo.pBufferMemoryBarriers = m_queueTransfers.data() + beginQueueTransfers;
         ctx.vk.CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
 
         LLVK_CHECK_RESULT(ctx.vk.EndCommandBuffer(cmdBuf));
@@ -1832,8 +1919,8 @@ void LlamaContext::uploadModel() {
     fprintf(stderr, "llama-vk: uploading");
     fflush(stderr);
 
-    ModelUploader uploader(*this);
-    uploader.openAndScan();
+    m_uploader = std::make_unique<ModelUploader>(*this);
+    m_uploader->openAndScan();
 
     // Upload tensors.
     //
@@ -1845,10 +1932,10 @@ void LlamaContext::uploadModel() {
     // in parallel with prompt processing, would be interesting.
     {
         TensorUpload uploads[] = {
-            {"tok_embeddings.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_numVocab,
+            {"tok_embeddings.weight", VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_numVocab,
              m_globalMemory.buffer(), m_globalOffsets.embedding},
         };
-        uploader.upload(uploads);
+        m_uploader->upload(uploads);
         fprintf(stderr, ".");
         fflush(stderr);
     }
@@ -1857,31 +1944,158 @@ void LlamaContext::uploadModel() {
         TensorUpload uploads[] = {
             {"layers." + std::to_string(layer) + ".attention_norm.weight", VKTYPE_F16, m_specData.nEmbd, 1,
              m_layerMemory[layer].buffer(), m_layerOffsets.attentionNorm},
-            {"layers." + std::to_string(layer) + ".attention.wq.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+            {"layers." + std::to_string(layer) + ".attention.wq.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nEmbd,
              m_layerMemory[layer].buffer(), m_layerOffsets.Wq},
-            {"layers." + std::to_string(layer) + ".attention.wk.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+            {"layers." + std::to_string(layer) + ".attention.wk.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nEmbd,
              m_layerMemory[layer].buffer(), m_layerOffsets.Wk},
-            {"layers." + std::to_string(layer) + ".attention.wv.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+            {"layers." + std::to_string(layer) + ".attention.wv.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nEmbd,
              m_layerMemory[layer].buffer(), m_layerOffsets.Wv},
-            {"layers." + std::to_string(layer) + ".attention.wo.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nEmbd,
+            {"layers." + std::to_string(layer) + ".attention.wo.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nEmbd,
              m_layerMemory[layer].buffer(), m_layerOffsets.Wo},
             {"layers." + std::to_string(layer) + ".ffn_norm.weight", VKTYPE_F16, m_specData.nEmbd, 1,
              m_layerMemory[layer].buffer(), m_layerOffsets.ffnNorm},
-            {"layers." + std::to_string(layer) + ".feed_forward.w1.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF,
+            {"layers." + std::to_string(layer) + ".feed_forward.w1.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nFF,
              m_layerMemory[layer].buffer(), m_layerOffsets.W1},
-            {"layers." + std::to_string(layer) + ".feed_forward.w2.weight", VKTYPE_Q4_0, m_specData.nFF, m_specData.nEmbd,
+            {"layers." + std::to_string(layer) + ".feed_forward.w2.weight", VKTYPE_Q4_0_SWZ, m_specData.nFF, m_specData.nEmbd,
              m_layerMemory[layer].buffer(), m_layerOffsets.W2},
-            {"layers." + std::to_string(layer) + ".feed_forward.w3.weight", VKTYPE_Q4_0, m_specData.nEmbd, m_specData.nFF,
+            {"layers." + std::to_string(layer) + ".feed_forward.w3.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nFF,
              m_layerMemory[layer].buffer(), m_layerOffsets.W3},
         };
-        uploader.upload(uploads);
+        m_uploader->upload(uploads);
         fprintf(stderr, ".");
         fflush(stderr);
     }
 
-    uploader.finish();
+    m_uploader->finish();
     fprintf(stderr, "\n");
     fflush(stderr);
+}
+
+void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
+    if (m_numSubmits >= 2)
+        m_semaphore.waitForever(m_numSubmits - 1);
+
+    // Step 1: Obtain command buffer and initialize constants.
+    VkCommandBuffer cmdBuf;
+    {
+        if (m_numSubmits < 2) {
+            VkCommandBufferAllocateInfo allocateInfo = {};
+            allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            allocateInfo.commandPool = m_computeCommandPool;
+            allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocateInfo.commandBufferCount = 1;
+
+            LLVK_CHECK_RESULT(vk.AllocateCommandBuffers(device, &allocateInfo, &cmdBuf));
+            m_commandBuffers[m_numSubmits] = cmdBuf;
+        } else {
+            // The wait above ensured that the old command buffer is idle, and
+            // vkBeginCommandBuffer resets it implicitly.
+            cmdBuf = m_commandBuffers[m_numSubmits % 2];
+        }
+
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        LLVK_CHECK_RESULT(vk.BeginCommandBuffer(cmdBuf, &beginInfo));
+
+        if (m_uploader && !m_uploader->m_queueTransfers.empty()) {
+            VkDependencyInfo dependencyInfo = {};
+            dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dependencyInfo.bufferMemoryBarrierCount = m_uploader->m_queueTransfers.size();
+            dependencyInfo.pBufferMemoryBarriers = m_uploader->m_queueTransfers.data();
+            vk.CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
+
+            m_uploader->m_queueTransfers.clear();
+        }
+    }
+
+    unsigned kernelIdx = 0;
+
+    shader::GlobalConstantBuffer constants = {};
+    constants.rmsEpsilon = 1e-6f;
+    constants.currentRotaryPosition = 0;
+    constants.currentHistoryBase = 0;
+    constants.currentHistoryLength = 0;
+    constants.currentStorageIndex = 0;
+    constants.numKeyValueEntries = m_maxCacheEntries;
+    constants.currentToken = tokens[0];
+
+    vk.CmdUpdateBuffer(cmdBuf, m_globalMemory.buffer(), m_globalOffsets.constants[m_numPasses % 2].offset,
+                       sizeof(constants), &constants);
+
+    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
+
+    // Step 2: Inference
+    const VkDescriptorSet sets[2] = {
+        m_dsetGlobal[m_numPasses % 2],
+        m_dsetKernel[kernelIdx % 3],
+    };
+    vk.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 2, sets, 0, nullptr);
+
+    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16FirstRmsNorm);
+    vk.CmdDispatch(cmdBuf, 1, 1, 1);
+
+    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+    {
+        VkBufferCopy region;
+        region.srcOffset = m_globalOffsets.activations[1].offset;
+        region.dstOffset = m_hostOffsets.debugActivations.offset;
+        region.size = 2 * m_specData.nEmbd;
+
+        vk.CmdCopyBuffer(cmdBuf, m_globalMemory.buffer(), m_hostMemory.buffer(), 1, &region);
+    }
+
+    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+
+    // Step 3: Submit the upload command buffer
+    vk.EndCommandBuffer(cmdBuf);
+
+    m_numSubmits++;
+
+    VkCommandBufferSubmitInfo commandBufferSubmitInfo = {};
+    commandBufferSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    commandBufferSubmitInfo.commandBuffer = cmdBuf;
+
+    VkSemaphoreSubmitInfo semaphoreSubmitInfo = {};
+    semaphoreSubmitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    semaphoreSubmitInfo.semaphore = m_semaphore.semaphore();
+    semaphoreSubmitInfo.value = m_numSubmits;
+    semaphoreSubmitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkSubmitInfo2 submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &commandBufferSubmitInfo;
+    submitInfo.signalSemaphoreInfoCount = 1;
+    submitInfo.pSignalSemaphoreInfos = &semaphoreSubmitInfo;
+
+    LLVK_CHECK_RESULT(vk.QueueSubmit2(device.computeQueue(), 1, &submitInfo, nullptr));
+
+    // Step 4: Dump debug activations.
+    {
+        m_semaphore.waitForever(m_numSubmits);
+
+        void *activations =
+                m_hostMemory.map(m_hostOffsets.debugActivations.offset,
+                                 m_hostOffsets.debugActivations.range);
+
+        fprintf(stderr, "Debug activations:\n");
+        for (unsigned i = 0; i < 128; ++i) {
+            float val = *((_Float16 *)activations + i);
+            fprintf(stderr, " %+8f", val);
+            if (i % 8 == 7)
+                fprintf(stderr, "\n");
+        }
+
+        m_hostMemory.unmap();
+    }
 }
 
 } // namespace llvk
@@ -2105,6 +2319,8 @@ int main(int argc, char **argv) {
     for (const auto &token : embd_inp)
         printf("  %u: '%s'\n", token, llama_token_to_str(ctx, token));
     printf("--\n");
+
+    vkctx.process(embd_inp.data(), embd_inp.size());
 
     return 0;
 }

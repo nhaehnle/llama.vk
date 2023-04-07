@@ -251,6 +251,7 @@ perplexity: examples/perplexity/perplexity.cpp ggml.o llama.o common.o
 	$(CXX) $(CXXFLAGS) examples/perplexity/perplexity.cpp ggml.o llama.o common.o -o perplexity $(LDFLAGS)
 
 KERNELS := \
+	KernelThinFp16FirstRmsNorm \
 	KernelThinFp16RmsNorm \
 	KernelThinFp16Attention
 

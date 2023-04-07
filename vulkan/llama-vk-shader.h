@@ -9,6 +9,7 @@ using uint = uint32_t;
 struct GlobalConstantBuffer {
     float rmsEpsilon;
     uint currentRotaryPosition;
+    uint currentToken;
     uint currentStorageIndex;
     uint currentHistoryBase;
     uint currentHistoryLength;

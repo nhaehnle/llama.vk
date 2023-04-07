@@ -4,7 +4,9 @@
 // Descriptor set 1: Kernel-specific
 // Descriptor set 2: Layer globals
 
-typedef float16_t activation;
+#include "llama-vk-shader.h"
+
+#define DEBUG_FIRST_RMS_NORM 0
 
 enum WeightFormat {
     WeightFormatQ4_0gpu = 2,
@@ -13,46 +15,216 @@ enum WeightFormat {
 [[vk::constant_id(0)]] const uint specNEmbd = 6656; // LLaMa 30B
 [[vk::constant_id(1)]] const uint specNCtx = 2048; // LLaMa
 [[vk::constant_id(2)]] const uint specNFF = 17920; // LLaMa 30B
-[[vk::constant_id(3)]] const float specRotaryTheta = 10000.0;
+[[vk::constant_id(3)]] const uint specNVocab = 32000; // all LLaMas
+[[vk::constant_id(4)]] const float specRotaryTheta = 10000.0;
 
 [[vk::binding(0, 0)]] cbuffer ForwardPassConstants {
-    struct {
-        float rmsEpsilon;
-        uint currentRotaryPosition;
-        uint currentStorageIndex;
-        uint currentHistoryBase;
-        uint currentHistoryLength;
-        uint numKeyValueEntries;
-    } g_constants;
+    GlobalConstantBuffer g_constants;
 };
 
 [[vk::binding(1, 0)]] ByteAddressBuffer bufferHistoryIndex;
+[[vk::binding(2, 0)]] ByteAddressBuffer bufferEmbedding;
 
-[[vk::binding(0, 1)]] RWByteAddressBuffer bufferInput;
+[[vk::binding(0, 1)]] ByteAddressBuffer bufferInput;
 [[vk::binding(1, 1)]] RWByteAddressBuffer bufferOutput;
 
-[[vk::binding(1, 2)]] RWByteAddressBuffer bufferWq;
-[[vk::binding(2, 2)]] RWByteAddressBuffer bufferWk;
-[[vk::binding(3, 2)]] RWByteAddressBuffer bufferWv;
-[[vk::binding(4, 2)]] RWByteAddressBuffer bufferWo;
+[[vk::binding(0, 2)]] ByteAddressBuffer bufferAttentionNorm;
+[[vk::binding(1, 2)]] ByteAddressBuffer bufferWq;
+[[vk::binding(2, 2)]] ByteAddressBuffer bufferWk;
+[[vk::binding(3, 2)]] ByteAddressBuffer bufferWv;
+[[vk::binding(4, 2)]] ByteAddressBuffer bufferWo;
 
 [[vk::binding(5, 2)]] RWByteAddressBuffer bufferKeys;
 [[vk::binding(6, 2)]] RWByteAddressBuffer bufferValues;
 
-#define NUM_WGP_THREADS 256
-#define NUM_WAVE_THREADS 64
+#define NUM_WGP_THREADS 256 // multiple of a wave size!
 
 groupshared float gRmsScratch[NUM_WGP_THREADS];
+
+void rmsNormTopHalf(uint tid, uint numPerLane, half activations[32]) {
+    // Compute sum of squares in parallel streams to hide ALU latency
+    float means[3] = { 0, 0, 0 };
+
+    uint idx;
+    [[unroll]] for (idx = 0; idx + 3 <= numPerLane; idx += 3) {
+        [[unroll]] for (uint i = 0; i < 3; ++i) {
+            float x = activations[idx + i];
+            means[i] += x * x;
+        }
+    }
+    [[unroll]] for (uint i = 0; idx + i < numPerLane; ++i) {
+        float x = activations[idx + i];
+        means[i] += x * x;
+    }
+
+    // Reduce across threads
+    gRmsScratch[tid] = means[0] + means[1] + means[2];
+}
+
+void rmsNormBottomHalf(uint tid, uint numThreads, uint numPerLane, inout half activations[32]) {
+    uint lane = WaveGetLaneIndex();
+    uint waveSize = WaveGetLaneCount();
+    uint numWaves = (numThreads + waveSize - 1) / waveSize;
+
+    float mean = 0.0;
+    [[unroll]] for (uint wave = 0; wave < numWaves; ++wave)
+        mean += gRmsScratch[wave * waveSize + lane];
+    mean = WaveActiveSum(mean);
+    mean *= 1.0 / specNEmbd;
+
+    if (tid >= numThreads)
+        return;
+
+    // Write activations out to memory
+    half scale = half(1.0 / sqrt(g_constants.rmsEpsilon + mean));
+
+    [[unroll]] for (uint idx = 0; idx < numPerLane; ++idx)
+        activations[idx] *= scale;
+}
+
+void storeActivations(uint tid, uint numThreads, uint numPerLane, half activations[32],
+                      uint base, bool storeSwizzled) {
+    uint offset;
+    if (storeSwizzled)
+        offset = 16 * tid;
+    else
+        offset = 2 * numPerLane * tid;
+
+    uint idx = 0;
+    [[unroll]] for (; idx + 8 <= numPerLane; idx += 8) {
+        half4 vec1;
+        half4 vec2;
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            vec1[i] = activations[idx + i];
+            vec2[i] = activations[idx + i + 4];
+        }
+        bufferOutput.Store(base + offset, vec1);
+        bufferOutput.Store(base + offset + 8, vec2);
+        if (storeSwizzled)
+            offset += numThreads * 16;
+        else
+            offset += 16;
+    }
+
+    if (storeSwizzled)
+        offset = 2 * idx * numThreads + 4 * tid;
+    [[unroll]] for (; idx + 2 <= numPerLane; idx += 2) {
+        half2 word;
+        word.x = activations[idx];
+        word.y = activations[idx + 1];
+        bufferOutput.Store(base + offset, word);
+        if (storeSwizzled)
+            offset += numThreads * 4;
+        else
+            offset += 4;
+    }
+
+    if (idx < numPerLane) {
+        if (storeSwizzled)
+            offset = 2 * idx * numThreads + 2 * tid;
+        bufferOutput.Store(base + offset, activations[idx]);
+    }
+}
+
+// In a single workgroup, compute the entire
+//
+//   attentionNorm * rmsNorm(embedding)
+//
+// activations vector for a single token.
+//
+// Each lane process either 16 or 32 vector elements, as this simplifies the
+// dequantization.
+//
+// Uses full compute subgroups.
+[numthreads(NUM_WGP_THREADS, 1, 1)]
+void KernelThinFp16FirstRmsNorm(uint3 localTid : SV_GroupThreadID) {
+    uint rmsNEmbdPerLane = (specNEmbd + NUM_WGP_THREADS - 1) / NUM_WGP_THREADS;
+    if (rmsNEmbdPerLane > 16)
+        rmsNEmbdPerLane = 32;
+    else
+        rmsNEmbdPerLane = 16;
+
+    uint numThreads = specNEmbd / rmsNEmbdPerLane;
+
+    uint lane = WaveGetLaneIndex();
+    uint waveSize = WaveGetLaneCount();
+    uint waveId = localTid.x / waveSize; // TODO: Can we get DXC to emit SubgroupId?
+    uint tid = waveId * waveSize + lane;
+    uint numLiveWaves = (numThreads + waveSize - 1) / waveSize;
+
+    // We keep all activations in registers
+    half activations[32];
+
+    if (waveId < numLiveWaves) {
+        // Step 1: Fetch and dequantize activations into registers
+        uint rowScaleBytes = 4 * specNEmbd / 64;
+        uint rowWeightBytes = 32 * specNEmbd / 64;
+        uint totalScaleBytes = rowScaleBytes * specNVocab;
+        uint baseScales = g_constants.currentToken * rowScaleBytes;
+        uint baseWeights = totalScaleBytes + g_constants.currentToken * rowWeightBytes;
+
+        uint doubleBlockIdx = tid * rmsNEmbdPerLane / 64;
+        uint subBlockIdx = (tid * rmsNEmbdPerLane / 16) % 4;
+
+        if (tid < numThreads) {
+            // Workaround: HLSL forces the load offset to be a multiple of 4 :(
+            half2 scales = bufferEmbedding.Load<half2>(baseScales + 4 * doubleBlockIdx);
+            half scale = scales[subBlockIdx / 2];
+            uint4 weights;
+            if (rmsNEmbdPerLane == 32) {
+                weights = bufferEmbedding.Load<uint4>(baseWeights + 32 * doubleBlockIdx);
+            } else {
+                weights.xy = bufferEmbedding.Load<uint2>(baseWeights + 32 * doubleBlockIdx + 8 * subBlockIdx);
+            }
+
+#if DEBUG_FIRST_RMS_NORM
+            if (tid < 4) {
+                printf("tid: %u token: %u, baseScales: %u baseWeights: %u\n", tid, g_constants.currentToken, baseScales, baseWeights);
+                printf("tid: %u doubleBlockIdx: %u, scale: %f, weights: %v4x\n", tid, doubleBlockIdx, (float)scale, weights);
+            }
+#endif
+
+            [[unroll]] for (uint idx = 0; idx < rmsNEmbdPerLane; idx += 8) {
+                for (uint nibble = 0; nibble < 8; ++nibble) {
+                    uint bits = (weights[idx / 8] >> (4 * nibble)) & 0xf;
+                    activations[idx + nibble] = (half)((int)bits - 8) * scale;
+                }
+            }
+        } else {
+            [[unroll]] for (uint idx = 0; idx < rmsNEmbdPerLane; ++idx)
+                activations[idx] = 0;
+        }
+
+#if DEBUG_FIRST_RMS_NORM
+        if (tid < 2) {
+            printf("tid: %u, numThreads: %u, per lane: %u %f %f %f %f\n", tid, numThreads, rmsNEmbdPerLane,
+                (float)activations[0], (float)activations[1], (float)activations[2], (float)activations[3]);
+        }
+#endif
+
+        rmsNormTopHalf(tid, rmsNEmbdPerLane, activations);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (waveId < numLiveWaves) {
+        // TODO: attention norm!
+        rmsNormBottomHalf(tid, numThreads, rmsNEmbdPerLane, activations);
+
+        storeActivations(tid, numThreads, rmsNEmbdPerLane, activations, 0, false);
+    }
+}
 
 // TODO: Use specialization constants
 // TODO: Target wave64 in WGP mode
 [numthreads(NUM_WGP_THREADS, 1, 1)]
 void KernelThinFp16RmsNorm(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
     // LLaMa 30B: rmsNEmbdPerLane = 26
+    // LLaMa 65B: rmsNEmbdPerLane = 32
     const uint rmsNEmbdPerLane = (specNEmbd + NUM_WGP_THREADS - 1) / NUM_WGP_THREADS;
 
     // Load all activations into registers
-    half activations[/* rmsNEmbdPerLane */ 32]; // TODO
+    half activations[/* rmsNEmbdPerLane */ 32]; // TODO:
 
     uint base = 0; // TODO
     uint offset = 16 * localTid.x;
@@ -77,72 +249,17 @@ void KernelThinFp16RmsNorm(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThre
 
     if (idx < rmsNEmbdPerLane) {
         offset = 2 * idx * NUM_WGP_THREADS + 2 * localTid.x;
-        if (NUM_WGP_THREADS * idx + localTid.x < specNEmbd) {
-            activations[idx] = bufferInput.Load<half>(base + offset);
-        } else {
-            activations[idx] = 0;
-        }
+        activations[idx] = bufferInput.Load<half>(base + offset);
     }
 
-    // Compute sum of squares in parallel
-    float means[3] = { 0, 0, 0 };
-    [[unroll]] for (idx = 0; idx + 3 <= rmsNEmbdPerLane; idx += 3) {
-        [[unroll]] for (uint i = 0; i < 3; ++i) {
-            float x = activations[idx + i];
-            means[i] += x * x;
-        }
-    }
-    [[unroll]] for (uint i = 0; idx + i < rmsNEmbdPerLane; ++i) {
-        float x = activations[idx + i];
-        means[i] += x * x;
-    }
-
-    // Reduce across threads
-    gRmsScratch[localTid.x] = means[0] + means[1] + means[2];
+    rmsNormTopHalf(localTid.x, rmsNEmbdPerLane, activations);
 
     GroupMemoryBarrierWithGroupSync();
 
-    uint lane = WaveGetLaneIndex();
-    uint waveSize = WaveGetLaneCount();
+    // TODO: attention norm!
+    rmsNormBottomHalf(localTid.x, NUM_WGP_THREADS, rmsNEmbdPerLane, activations);
 
-    float mean = 0.0;
-    [[unroll]] for (i = 0; i < NUM_WGP_THREADS / waveSize; ++i)
-        mean += gRmsScratch[i * waveSize + lane];
-    mean = WaveActiveSum(mean);
-    mean *= 1.0 / specNEmbd;
-
-    // Write activations out to memory
-    half scale = half(1.0 / sqrt(g_constants.rmsEpsilon + mean));
-
-    offset = 16 * localTid.x;
-    idx = 0;
-    [[unroll]] for (; idx + 8 <= rmsNEmbdPerLane; idx += 8) {
-        half4 vec1;
-        half4 vec2;
-        [[unroll]] for (uint i = 0; i < 4; ++i) {
-            vec1[i] = scale * activations[idx + i];
-            vec2[i] = scale * activations[idx + i + 4];
-        }
-        bufferOutput.Store(base + offset, vec1);
-        bufferOutput.Store(base + offset + 8, vec2);
-        offset += NUM_WGP_THREADS * 16;
-    }
-
-    offset = 2 * idx * NUM_WGP_THREADS + 4 * localTid.x;
-    [[unroll]] for (; idx + 2 <= rmsNEmbdPerLane; idx += 2) {
-        half2 word;
-        word.x = scale * activations[idx];
-        word.y = scale * activations[idx + 1];
-        bufferOutput.Store(base + offset, word);
-        offset += NUM_WGP_THREADS * 4;
-    }
-
-    if (idx < rmsNEmbdPerLane) {
-        offset = 2 * idx * NUM_WGP_THREADS + 2 * localTid.x;
-        if (NUM_WGP_THREADS * idx + localTid.x < specNEmbd) {
-            bufferOutput.Store(base + offset, scale * activations[idx]);
-        }
-    }
+    storeActivations(localTid.x, NUM_WGP_THREADS, rmsNEmbdPerLane, activations, base, true);
 }
 
 #define NUM_THIN_ATTENTION_THREADS 128 // = n_rot
