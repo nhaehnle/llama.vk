@@ -948,6 +948,15 @@ public:
     void process(const llama_token *token, size_t numTokens);
 
 private:
+    struct WriteHistoryIndex {
+        unsigned historyIndex;
+        unsigned storageIndex;
+    };
+
+    void submitPass(const shader::GlobalConstantBuffer &constants,
+                    const WriteHistoryIndex &writeHistory,
+                    bool debug);
+
     VkDescriptorSetLayout createDescriptorSetLayoutImpl(const VkDescriptorSetLayoutBinding *bindings, size_t count);
     template <int N>
     VkDescriptorSetLayout createDescriptorSetLayout(const VkDescriptorSetLayoutBinding (&bindings)[N]) {
@@ -1028,7 +1037,22 @@ private:
     uint64_t m_numSubmits = 0;
     unsigned m_numPasses = 0;
 
-    VkCommandBuffer m_commandBuffers[2] = {};
+    struct CommandBuffer {
+        LlamaContext *ctx = nullptr;
+        VkCommandBuffer cmdBuf = nullptr;
+        VkEvent historyWarEvent = nullptr;
+
+        CommandBuffer() = default;
+        ~CommandBuffer();
+
+        void init(LlamaContext &ctx);
+        void reset();
+
+        CommandBuffer(const CommandBuffer &rhs) = delete;
+        CommandBuffer &operator=(const CommandBuffer &rhs) = delete;
+    };
+
+    CommandBuffer m_commandBuffers[2];
 
     std::unique_ptr<ModelUploader> m_uploader;
 };
@@ -1210,8 +1234,8 @@ LlamaContext::~LlamaContext() {
 void LlamaContext::destroy() {
     m_semaphore.waitForever(m_numSubmits);
 
-    vk.FreeCommandBuffers(device, m_computeCommandPool, std::min<uint64_t>(m_numSubmits, 2), m_commandBuffers);
-    memset(&m_commandBuffers, 0, sizeof(m_commandBuffers));
+    m_commandBuffers[0].reset();
+    m_commandBuffers[1].reset();
 
 #define DESTROY(name) \
     do { \
@@ -1950,27 +1974,53 @@ void LlamaContext::uploadModel() {
     fflush(stderr);
 }
 
-void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
+LlamaContext::CommandBuffer::~CommandBuffer() {
+    reset();
+}
+
+void LlamaContext::CommandBuffer::reset() {
+    if (ctx) {
+        ctx->vk.DestroyEvent(ctx->device, historyWarEvent, nullptr);
+        ctx->vk.FreeCommandBuffers(ctx->device, ctx->m_computeCommandPool, 1, &cmdBuf);
+
+        ctx = nullptr;
+        historyWarEvent = nullptr;
+        cmdBuf = nullptr;
+    }
+}
+
+void LlamaContext::CommandBuffer::init(LlamaContext &ctx_) {
+    assert(!ctx || ctx == &ctx_);
+    if (ctx)
+        return;
+
+    ctx = &ctx_;
+
+    VkCommandBufferAllocateInfo allocateInfo = {};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocateInfo.commandPool = ctx->m_computeCommandPool;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandBufferCount = 1;
+    LLVK_CHECK_RESULT(ctx->vk.AllocateCommandBuffers(ctx->device, &allocateInfo, &cmdBuf));
+
+    VkEventCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
+    createInfo.flags = VK_EVENT_CREATE_DEVICE_ONLY_BIT;
+    LLVK_CHECK_RESULT(ctx->vk.CreateEvent(ctx->device, &createInfo, nullptr, &historyWarEvent));
+}
+
+void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, const WriteHistoryIndex &writeHistory, bool debug) {
     if (m_numSubmits >= 2)
         m_semaphore.waitForever(m_numSubmits - 1);
 
     // Step 1: Obtain command buffer and initialize constants.
+    CommandBuffer &commandBuffer = m_commandBuffers[m_numSubmits % 2];
     VkCommandBuffer cmdBuf;
     {
-        if (m_numSubmits < 2) {
-            VkCommandBufferAllocateInfo allocateInfo = {};
-            allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            allocateInfo.commandPool = m_computeCommandPool;
-            allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocateInfo.commandBufferCount = 1;
-
-            LLVK_CHECK_RESULT(vk.AllocateCommandBuffers(device, &allocateInfo, &cmdBuf));
-            m_commandBuffers[m_numSubmits] = cmdBuf;
-        } else {
-            // The wait above ensured that the old command buffer is idle, and
-            // vkBeginCommandBuffer resets it implicitly.
-            cmdBuf = m_commandBuffers[m_numSubmits % 2];
-        }
+        // The wait above ensured that the old command buffer is idle, and
+        // vkBeginCommandBuffer resets it implicitly.
+        commandBuffer.init(*this);
+        cmdBuf = commandBuffer.cmdBuf;
 
         VkCommandBufferBeginInfo beginInfo = {};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1988,23 +2038,34 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
         }
     }
 
-    shader::GlobalConstantBuffer constants = {};
-    constants.rmsEpsilon = 1e-6f;
-    constants.currentRotaryPosition = 0;
-    constants.currentHistoryBase = 0;
-    constants.currentHistoryLength = 0;
-    constants.currentStorageIndex = 0;
-    constants.numKeyValueEntries = m_maxCacheEntries;
-    constants.currentToken = tokens[0];
-
     vk.CmdUpdateBuffer(cmdBuf, m_globalMemory.buffer(), m_globalOffsets.constants[m_numPasses % 2].offset,
                        sizeof(constants), &constants);
 
     vk.utilCmdPipelineMemoryBarrier(cmdBuf,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
 
     // Step 2: Inference
+    bool haveHistoryEvent = false;
+    VkMemoryBarrier2 historyMemoryBarrier = {};
+    historyMemoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    historyMemoryBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    historyMemoryBarrier.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    historyMemoryBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    historyMemoryBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+
+    VkDependencyInfo historyDependencyInfo = {};
+    historyDependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    historyDependencyInfo.memoryBarrierCount = 1;
+    historyDependencyInfo.pMemoryBarriers = &historyMemoryBarrier;
+
+    auto setHistoryEvent = [&]() {
+        assert(!haveHistoryEvent);
+        haveHistoryEvent = true;
+
+        vk.CmdSetEvent2(cmdBuf, commandBuffer.historyWarEvent, &historyDependencyInfo);
+    };
+
     for (unsigned layer = 0; layer < m_numLayers; ++layer) {
         if (layer == 0) {
             const VkDescriptorSet sets[] = {
@@ -2030,6 +2091,11 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
 
         vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Attention);
         vk.CmdDispatch(cmdBuf, m_specData.nHead, 1, 1);
+
+        if (layer == m_numLayers - 1) {
+            // Signal the event after the last user of the history index.
+            setHistoryEvent();
+        }
 
         vk.utilCmdPipelineMemoryBarrier(cmdBuf,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -2064,13 +2130,23 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     }
 
+    if (!haveHistoryEvent)
+        setHistoryEvent();
+
+    vk.CmdWaitEvents2(cmdBuf, 1, &commandBuffer.historyWarEvent, &historyDependencyInfo);
+    vk.CmdResetEvent2(cmdBuf, commandBuffer.historyWarEvent, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+
+    vk.CmdUpdateBuffer(cmdBuf, m_globalMemory.buffer(),
+                       m_globalOffsets.historyIndex.offset + 4 * writeHistory.historyIndex,
+                       4, &writeHistory.storageIndex);
+
     vk.utilCmdPipelineMemoryBarrier(cmdBuf,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
-    {
+    if (debug) {
         VkBufferCopy region;
-        region.srcOffset = m_globalOffsets.bypass.offset;
+        region.srcOffset = m_globalOffsets.stage2.offset;
         region.dstOffset = m_hostOffsets.debugActivations.offset;
         region.size = 2 * m_specData.nEmbd;
 
@@ -2085,6 +2161,7 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
     vk.EndCommandBuffer(cmdBuf);
 
     m_numSubmits++;
+    m_numPasses++;
 
     VkCommandBufferSubmitInfo commandBufferSubmitInfo = {};
     commandBufferSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
@@ -2106,7 +2183,7 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
     LLVK_CHECK_RESULT(vk.QueueSubmit2(device.computeQueue(), 1, &submitInfo, nullptr));
 
     // Step 4: Dump debug activations.
-    {
+    if (debug) {
         m_semaphore.waitForever(m_numSubmits);
 
         void *activations =
@@ -2122,6 +2199,32 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
         }
 
         m_hostMemory.unmap();
+    }
+}
+
+void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
+    shader::GlobalConstantBuffer constants = {};
+    constants.rmsEpsilon = 1e-6f;
+    constants.currentHistoryBase = 0;
+    constants.numKeyValueEntries = m_maxCacheEntries;
+
+    unsigned historyGroup = constants.currentHistoryBase / m_specData.nCtx;
+
+    for (size_t idx = 0; idx < numTokens; ++idx) {
+        constants.currentToken = tokens[idx];
+        constants.currentRotaryPosition = idx;
+        constants.currentHistoryLength = idx;
+        constants.currentStorageIndex = idx;
+
+        WriteHistoryIndex writeHistory;
+        uint relativeIdx = (constants.currentHistoryBase + constants.currentHistoryLength) % m_specData.nCtx;
+        writeHistory.historyIndex = historyGroup * m_specData.nCtx + relativeIdx;
+        writeHistory.storageIndex = constants.currentStorageIndex;
+
+        bool debug = false;
+        submitPass(constants, writeHistory, debug);
+        if (debug)
+            break;
     }
 }
 

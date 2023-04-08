@@ -452,7 +452,7 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
         weightsOffset += weightsStride;
     }
 #if DEBUG_ATTENTION
-    if (head < 4 && tid % 35 == 0) {
+    if (head == 0 && tid / 8 < 1) {
         printf("head: %u tid: %3u (i = %3u) init: q = %+8f k = %+8f v = %+8f\n", head, tid,
             128 * head + tid, qResult, kResult, vResult);
     }
@@ -479,15 +479,21 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
     kResult = cost * kResult + sint * kOther;
 #if DEBUG_ATTENTION
     if (head == 0 && tid < 8) {
-        printf("tid: %u rope: q = %f k = %f qOther = %f kOther = %f cos(t) = %f sgn sin(t) = %f\n", tid,
+        printf("tid: %u rope: q = %+8f k = %+8f qOther = %+8f kOther = %+8f cos(t) = %f sgn sin(t) = %f\n", tid,
             qResult, kResult, qOther, kOther, cost, sint);
     }
 #endif
 
     // Step 1c: Broadcast and store to prepare for Q * K calculation
+    //
+    // NOTE: Work around having to use multiples of 4 as storage offset
     uint currentStorageOffset = 2 * (g_constants.currentStorageIndex * specNEmbd + head * n_rot + tid);
-    bufferKeys.Store<half>(currentStorageOffset, (half)kResult);
-    bufferValues.Store<half>(currentStorageOffset, (half)vResult);
+    float vOther = WaveReadLaneAt(vResult, lane ^ 1);
+    kOther = WaveReadLaneAt(kResult, lane ^ 1);
+    if ((lane & 1) == 0) {
+        bufferKeys.Store<half2>(currentStorageOffset, half2(kResult, kOther));
+        bufferValues.Store<half2>(currentStorageOffset, half2(vResult, vOther));
+    }
 
     gAttentionScratch16[0 * n_rot + tid] = (half)qResult;
     gAttentionScratch16[1 * n_rot + tid] = (half)kResult;
@@ -521,14 +527,19 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
             [[unroll]] for (i = 0; i < n_rot / 4; ++i)
                 k[i] = bufferKeys.Load<half4>(historyStorageOffset + 8 * i);
         }
-
+#if DEBUG_ATTENTION
+        if (head == 0 && history < 2) {
+            printf("head: %u history: %u historyIndex: %u\n", head, history, historyIndex);
+            printf("head: %u history: %u k: %+8v4f, %+8v4f\n", head, history, (float4)k[0], (float4)k[1]);
+        }
+#endif
         uint nextHistoryIndex;
         if (history + NUM_THIN_ATTENTION_THREADS <= g_constants.currentHistoryLength) {
             uint group = g_constants.currentHistoryBase / specNCtx;
             uint idx =
                     g_constants.currentHistoryBase
                     + g_constants.currentHistoryLength
-                    + specNCtx - history;
+                    + specNCtx - history - NUM_THIN_ATTENTION_THREADS;
             idx = specNCtx * group + (idx % specNCtx);
 
             nextHistoryIndex = bufferHistoryIndex.Load<uint>(4 * idx);
@@ -538,6 +549,7 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
         [[unroll]] for (i = 0; i < n_rot / 4; ++i) {
             qk += dot(q[i], k[i]);
         }
+        qk *= 1.0 / sqrt(n_rot);
         gAttentionQK[history] = qk;
         maxQK = max(maxQK, qk);
 #if DEBUG_ATTENTION
@@ -621,18 +633,30 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
             v = bufferValues.Load<half2>(storageOffset);
         }
 
+#if DEBUG_ATTENTION
+        if (head == 0 && partitionTid < 8) {
+            printf("head: %u tid: %3u history: %u historyIndex: %u\n", head, tid, history, historyIndex);
+        }
+#endif
+
         if (history + 2 <= g_constants.currentHistoryLength) {
             uint group = g_constants.currentHistoryBase / specNCtx;
             uint idx =
                     g_constants.currentHistoryBase
                     + g_constants.currentHistoryLength
-                    + specNCtx - history;
+                    + specNCtx - history - 2;
             idx = specNCtx * group + (idx % specNCtx);
 
             historyIndex = bufferHistoryIndex.Load<uint>(4 * idx);
         }
 
         oResult += gAttentionQK[history] * v;
+#if DEBUG_ATTENTION
+        if (head == 0 && partitionTid < 8) {
+            printf("head: %u tid: %3u history: %u - weight: %+8f v: %+8v2f oResult: %+8v2f\n",
+                head, tid, history, gAttentionQK[history], (float2)v, oResult);
+        }
+#endif
     }
 
     // The low half is probably done before the high half (because the first
