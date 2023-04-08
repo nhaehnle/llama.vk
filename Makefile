@@ -252,6 +252,7 @@ perplexity: examples/perplexity/perplexity.cpp ggml.o llama.o common.o
 
 KERNELS := \
 	KernelThinFp16Attention \
+	KernelThinFp16Ffn \
 	KernelThinFp16FirstRmsNorm \
 	KernelThinFp16MatMulAdd \
 	KernelThinFp16RmsNorm

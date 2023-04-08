@@ -7,6 +7,7 @@
 #include "llama-vk-shader.h"
 
 #define DEBUG_FIRST_RMS_NORM 0
+#define DEBUG_ATTENTION 0
 #define DEBUG_ASSERTIONS 1
 
 
@@ -450,9 +451,10 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
         scaleOffset += scaleStride;
         weightsOffset += weightsStride;
     }
-#if 0
-    if (head == 0 && tid < 8) {
-        printf("tid: %u init: q = %f k = %f v = %f\n", tid, qResult, kResult, vResult);
+#if DEBUG_ATTENTION
+    if (head < 4 && tid % 35 == 0) {
+        printf("head: %u tid: %3u (i = %3u) init: q = %+8f k = %+8f v = %+8f\n", head, tid,
+            128 * head + tid, qResult, kResult, vResult);
     }
 #endif
     // Step 1b: Apply rotary position embedding on Q and K
@@ -475,7 +477,7 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
     sint = (lane & 1) == 1 ? sint : -sint;
     qResult = cost * qResult + sint * qOther;
     kResult = cost * kResult + sint * kOther;
-#if 0
+#if DEBUG_ATTENTION
     if (head == 0 && tid < 8) {
         printf("tid: %u rope: q = %f k = %f qOther = %f kOther = %f cos(t) = %f sgn sin(t) = %f\n", tid,
             qResult, kResult, qOther, kOther, cost, sint);
@@ -538,7 +540,7 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
         }
         gAttentionQK[history] = qk;
         maxQK = max(maxQK, qk);
-#if 1
+#if DEBUG_ATTENTION
         if (head < 8) {
             printf("head: %u tid: %u history: %u qk: %f maxQK: %f\n", head, tid, history, qk, maxQK);
         }
@@ -570,10 +572,6 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
         gAttentionQK[history] = qk;
 
         sum += qk;
-
-        if (head < 8) {
-            printf("head: %u tid: %u history: %u qk: %f maxQK: %f sum: %f\n", head, tid, history, qk, maxQK, sum);
-        }
     }
 
     gAttentionScratch32[NUM_THIN_ATTENTION_THREADS + tid] = sum;
@@ -586,10 +584,6 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
     sum = WaveActiveSum(sum);
 
     float recipSum = 1.0 / sum;
-
-    if (head < 8 && tid == 0) {
-        printf("head: %u tid: %u sum: %f recipSum: %f\n", head, tid, sum, recipSum);
-    }
 
     // Step 4: softmax(QK) * V
     //
@@ -742,5 +736,102 @@ void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
     if (outIdx % 2 == 0) {
         half2 data = half2(result, otherResult);
         bufferBypass.Store<half2>(4 * (outIdx / 2), data);
+    }
+}
+
+// Main part of feed forward network: SILU(x * W1) * (x * W3)
+//
+// Every lane computes a single output element.
+//
+// TODO: Use specialization constants or push constants?
+// TODO: Target wave32 in WGP mode
+[numthreads(NUM_THIN_MATMUL_THREADS, 1, 1)]
+void KernelThinFp16Ffn(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
+    uint outIdx = gid.x * NUM_THIN_MATMUL_THREADS + localTid.x;
+
+    uint numIn = specNEmbd;
+    uint numOut = specNFF;
+
+    // Step 1: Matrix multiplies.
+    // Assume Q4_0_SWZ format.
+    uint nDoubleBlocks = numIn / 64;
+    uint matrixScaleBytes = 4 * nDoubleBlocks * numOut;
+
+    uint scaleOffset = 0 + outIdx * 4;
+    uint scaleStride = numOut * 4;
+    uint weightsOffset = matrixScaleBytes + outIdx * 32;
+    uint weightsStride = numOut * 32;
+
+    float result1 = 0;
+    float result3 = 0;
+
+    uint inOffset = 0;
+    for (uint blockIdx = 0; blockIdx < nDoubleBlocks; ++blockIdx) {
+        uint4 rawWeights1[2];
+        uint4 rawWeights3[2];
+        half2 activations[2][4][4];
+        uint sub, i;
+        [[unroll]] for (sub = 0; sub < 2; ++sub) {
+            rawWeights1[sub] = bufferW1.Load<uint4>(weightsOffset + 16 * sub);
+            rawWeights3[sub] = bufferW3.Load<uint4>(weightsOffset + 16 * sub);
+
+            [[unroll]] for (i = 0; i < 4; ++i) {
+                [[unroll]] for (uint byte = 0; byte < 4; ++byte) {
+                    activations[sub][i][byte] = bufferStage1.Load<half2>(inOffset);
+                    inOffset += 4;
+                }
+            }
+        }
+
+        half2 scales1 = bufferW1.Load<half2>(scaleOffset);
+        half2 scales3 = bufferW3.Load<half2>(scaleOffset);
+
+        [[unroll]] for (sub = 0; sub < 2; ++sub) {
+            float sum1 = 0;
+            float sum3 = 0;
+
+            [[unroll]] for (i = 0; i < 4; ++i) {
+                uint lowWeights1 = rawWeights1[sub][i] & 0x0f0f0f0f;
+                uint highWeights1 = (rawWeights1[sub][i] >> 4) & 0x0f0f0f0f;
+                uint lowWeights3 = rawWeights3[sub][i] & 0x0f0f0f0f;
+                uint highWeights3 = (rawWeights3[sub][i] >> 4) & 0x0f0f0f0f;
+
+                [[unroll]] for (uint byte = 0; byte < 4; ++byte) {
+                    int16_t2 utmp;
+                    half2 prod;
+
+                    utmp.x = (int16_t)((lowWeights1 >> (8 * byte)) & 0xff);
+                    utmp.y = (int16_t)((highWeights1 >> (8 * byte)) & 0xff);
+                    prod = (half2)(utmp - 8) * activations[sub][i][byte];
+                    sum1 += prod.x + prod.y;
+
+                    utmp.x = (int16_t)((lowWeights3 >> (8 * byte)) & 0xff);
+                    utmp.y = (int16_t)((highWeights3 >> (8 * byte)) & 0xff);
+                    prod = (half2)(utmp - 8) * activations[sub][i][byte];
+                    sum3 += prod.x + prod.y;
+                }
+            }
+
+            result1 += scales1[sub] * sum1;
+            result3 += scales3[sub] * sum3;
+        }
+
+        scaleOffset += scaleStride;
+        weightsOffset += weightsStride;
+    }
+
+    // Step 2: SILU and multiply
+    float result = result1/(1.0 + exp(-result1)) * result3;
+
+    // NOTE: Can only store at offsets that are a multiple of 4 :(
+    //
+    // ATTN: Assume a linear layout of threads!
+    uint lane = WaveGetLaneIndex();
+    uint waveSize = WaveGetLaneCount();
+    float otherResult = WaveReadLaneAt(result, lane ^ 1);
+
+    if (outIdx % 2 == 0) {
+        half2 data = half2(result, otherResult);
+        bufferStage2.Store<half2>(4 * (outIdx / 2), data);
     }
 }

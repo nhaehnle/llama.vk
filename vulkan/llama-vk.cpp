@@ -964,6 +964,7 @@ private:
     unsigned m_maxCacheEntries;
 
     VkPipeline m_kernelThinFp16Attention = nullptr;
+    VkPipeline m_kernelThinFp16Ffn = nullptr;
     VkPipeline m_kernelThinFp16FirstRmsNorm = nullptr;
     VkPipeline m_kernelThinFp16MatMulAdd = nullptr;
     VkPipeline m_kernelThinFp16RmsNormAttention = nullptr;
@@ -1063,6 +1064,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     LLVK_CHECK_RESULT(vk.CreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout));
 
     m_kernelThinFp16Attention = createPipeline("KernelThinFp16Attention");
+    m_kernelThinFp16Ffn = createPipeline("KernelThinFp16Ffn");
     m_specData.mode = 0;
     m_kernelThinFp16FirstRmsNorm = createPipeline("KernelThinFp16FirstRmsNorm");
     m_kernelThinFp16MatMulAdd = createPipeline("KernelThinFp16MatMulAdd");
@@ -1252,6 +1254,7 @@ void LlamaContext::destroy() {
     } while(false)
 
     DESTROY(m_kernelThinFp16Attention);
+    DESTROY(m_kernelThinFp16Ffn);
     DESTROY(m_kernelThinFp16FirstRmsNorm);
     DESTROY(m_kernelThinFp16MatMulAdd);
     DESTROY(m_kernelThinFp16RmsNormAttention);
@@ -2030,11 +2033,18 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
 
     vk.utilCmdPipelineMemoryBarrier(cmdBuf,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Ffn);
+    vk.CmdDispatch(cmdBuf, m_specData.nFF / NUM_THIN_MATMUL_THREADS, 1, 1);
+
+    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
     {
         VkBufferCopy region;
-        region.srcOffset = m_globalOffsets.stage1.offset;
+        region.srcOffset = m_globalOffsets.stage2.offset;
         region.dstOffset = m_hostOffsets.debugActivations.offset;
         region.size = 2 * m_specData.nEmbd;
 
