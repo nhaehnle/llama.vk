@@ -70,6 +70,7 @@ extern "C" {
         int n_vocab;
         int n_parts;
         int n_embd;
+        int n_head;
         int n_ff;
         int n_layer;
         size_t tensors_offset;

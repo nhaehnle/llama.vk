@@ -898,6 +898,7 @@ struct SpecConstants {
     uint nCtx = 2048;
     uint nFF = 17920;
     uint nVocab = 32000;
+    uint nHead = 52;
     float rotaryTheta = 10000.0;
 };
 static const VkSpecializationMapEntry g_specMapEntries[] = {
@@ -905,18 +906,17 @@ static const VkSpecializationMapEntry g_specMapEntries[] = {
     { 1, offsetof(SpecConstants, nCtx), sizeof(SpecConstants::nCtx) },
     { 2, offsetof(SpecConstants, nFF), sizeof(SpecConstants::nFF) },
     { 3, offsetof(SpecConstants, nVocab), sizeof(SpecConstants::nVocab) },
-    { 4, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
+    { 4, offsetof(SpecConstants, nHead), sizeof(SpecConstants::nHead) },
+    { 5, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutGlobal[] = {
     { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // constants
     { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // history indices
     { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // embedding weights
-};
-
-static const VkDescriptorSetLayoutBinding g_dsetLayoutPerKernel[] = {
-    { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // input
-    { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // output
+    { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations bypass
+    { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage1
+    { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage2
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
@@ -958,6 +958,7 @@ private:
 
     VkPipeline m_kernelThinFp16Attention = nullptr;
     VkPipeline m_kernelThinFp16FirstRmsNorm = nullptr;
+    VkPipeline m_kernelThinFp16MatMulAdd = nullptr;
     VkPipeline m_kernelThinFp16RmsNorm = nullptr;
 
     VkPipelineLayout m_pipelineLayout = nullptr;
@@ -969,7 +970,6 @@ private:
     VkDescriptorPool m_descriptorPool = nullptr;
 
     VkDescriptorSet m_dsetGlobal[2] = {};
-    VkDescriptorSet m_dsetKernel[3] = {};
     std::vector<VkDescriptorSet> m_dsetLayer;
 
     struct {
@@ -977,7 +977,9 @@ private:
         Range constants[2];
         Range historyIndex;
         Range embedding;
-        Range activations[3];
+        Range bypass;
+        Range stage1;
+        Range stage2;
     } m_globalOffsets;
     MemoryAndBuffer m_globalMemory;
 
@@ -1030,6 +1032,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     m_maxCacheEntries = maxCacheEntries;
     m_specData.nEmbd = fileInfo.n_embd;
     m_specData.nFF = fileInfo.n_ff;
+    m_specData.nHead = fileInfo.n_head;
 
     // Step 1: Descriptor set and pipeline layouts and pipelines
     m_specInfo.mapEntryCount = sizeof(g_specMapEntries) / sizeof(g_specMapEntries[0]);
@@ -1038,12 +1041,10 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     m_specInfo.pData = &m_specData;
 
     m_dsetLayoutGlobal = createDescriptorSetLayout(g_dsetLayoutGlobal);
-    m_dsetLayoutPerKernel = createDescriptorSetLayout(g_dsetLayoutPerKernel);
     m_dsetLayoutPerLayer = createDescriptorSetLayout(g_dsetLayoutPerLayer);
 
     const VkDescriptorSetLayout setLayouts[] = {
         m_dsetLayoutGlobal,
-        m_dsetLayoutPerKernel,
         m_dsetLayoutPerLayer,
     };
 
@@ -1053,9 +1054,10 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     pipelineLayoutCreateInfo.pSetLayouts = setLayouts;
     LLVK_CHECK_RESULT(vk.CreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout));
 
-    m_kernelThinFp16FirstRmsNorm = createPipeline("KernelThinFp16FirstRmsNorm");
-    m_kernelThinFp16RmsNorm = createPipeline("KernelThinFp16RmsNorm");
     m_kernelThinFp16Attention = createPipeline("KernelThinFp16Attention");
+    m_kernelThinFp16FirstRmsNorm = createPipeline("KernelThinFp16FirstRmsNorm");
+    m_kernelThinFp16MatMulAdd = createPipeline("KernelThinFp16MatMulAdd");
+    m_kernelThinFp16RmsNorm = createPipeline("KernelThinFp16RmsNorm");
 
     // Step 2: Memory allocation
     //
@@ -1089,15 +1091,14 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
         OFFSET(m_globalOffsets, constants[0], sizeof(shader::GlobalConstantBuffer));
         OFFSET(m_globalOffsets, constants[1], sizeof(shader::GlobalConstantBuffer));
-        OFFSET(m_globalOffsets, historyIndex, 2 * 2048);
+        OFFSET(m_globalOffsets, historyIndex, 4 * 2048);
 
         uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_numVocab);
         OFFSET(m_globalOffsets, embedding, embdMatrixSize);
 
-        uint64_t activationSize = 2 * m_specData.nEmbd;
-        OFFSET(m_globalOffsets, activations[0], activationSize);
-        OFFSET(m_globalOffsets, activations[1], activationSize);
-        OFFSET(m_globalOffsets, activations[2], activationSize);
+        OFFSET(m_globalOffsets, bypass, 2 * m_specData.nEmbd);
+        OFFSET(m_globalOffsets, stage1, 2 * m_specData.nEmbd);
+        OFFSET(m_globalOffsets, stage2, 2 * m_specData.nFF); // can hold both nEmbd and nFF
 
         printf("vulkan: allocating %s of device memory\n",
                formatNumBytes(m_globalOffsets.size + m_numLayers * m_layerOffsets.size).c_str());
@@ -1113,7 +1114,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
             m_layerMemory.push_back(std::move(memory));
         }
 
-        OFFSET(m_hostOffsets, debugActivations, activationSize);
+        OFFSET(m_hostOffsets, debugActivations, 2 * m_specData.nFF);
         m_hostMemory = device.allocateHost(m_hostOffsets.size);
         if (!m_hostMemory.valid())
             exit(1);
@@ -1123,7 +1124,6 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     {
         unsigned globalSets = sizeof(m_dsetGlobal) / sizeof(m_dsetGlobal[0]); // Double buffer
         unsigned layerSets = m_numLayers;
-        unsigned kernelSets = sizeof(m_dsetKernel) / sizeof(m_dsetKernel[0]); // Triple buffer(?)
 
         const VkDescriptorPoolSize poolSizes[] = {
             {
@@ -1133,22 +1133,20 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
             {
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     (uint32_t)(
-                        globalSets * 2
+                        globalSets * (sizeof(g_dsetLayoutGlobal) / sizeof(g_dsetLayoutGlobal[0]) - 1)
                         + layerSets * sizeof(g_dsetLayoutPerLayer) / sizeof(g_dsetLayoutPerLayer[0])
-                        + kernelSets * sizeof(g_dsetLayoutPerKernel) / sizeof(g_dsetLayoutPerKernel[0])
                     ),
             },
         };
 
         VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {};
         descriptorPoolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        descriptorPoolCreateInfo.maxSets = globalSets + layerSets + kernelSets;
+        descriptorPoolCreateInfo.maxSets = globalSets + layerSets;
         descriptorPoolCreateInfo.poolSizeCount = sizeof(poolSizes) / sizeof(poolSizes[0]);
         descriptorPoolCreateInfo.pPoolSizes = poolSizes;
         LLVK_CHECK_RESULT(vk.CreateDescriptorPool(device, &descriptorPoolCreateInfo, nullptr, &m_descriptorPool));
 
         device.allocateDescriptorSets(m_descriptorPool, m_dsetLayoutGlobal, globalSets, m_dsetGlobal);
-        device.allocateDescriptorSets(m_descriptorPool, m_dsetLayoutPerKernel, kernelSets, m_dsetKernel);
         m_dsetLayer.resize(m_numLayers);
         device.allocateDescriptorSets(m_descriptorPool, m_dsetLayoutPerLayer, m_numLayers, m_dsetLayer.data());
 
@@ -1157,11 +1155,9 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
             write.writeUniform(m_dsetGlobal[i], 0, m_globalMemory.buffer(), m_globalOffsets.constants[i]);
             write.writeStorage(m_dsetGlobal[i], 1, m_globalMemory.buffer(), m_globalOffsets.historyIndex);
             write.writeStorage(m_dsetGlobal[i], 2, m_globalMemory.buffer(), m_globalOffsets.embedding);
-        }
-
-        for (unsigned i = 0; i < kernelSets; ++i) {
-            write.writeStorage(m_dsetKernel[i], 0, m_globalMemory.buffer(), m_globalOffsets.activations[i]);
-            write.writeStorage(m_dsetKernel[i], 1, m_globalMemory.buffer(), m_globalOffsets.activations[(i + 1) % kernelSets]);
+            write.writeStorage(m_dsetGlobal[i], 3, m_globalMemory.buffer(), m_globalOffsets.bypass);
+            write.writeStorage(m_dsetGlobal[i], 4, m_globalMemory.buffer(), m_globalOffsets.stage1);
+            write.writeStorage(m_dsetGlobal[i], 5, m_globalMemory.buffer(), m_globalOffsets.stage2);
         }
 
         for (unsigned i = 0; i < m_numLayers; ++i) {
@@ -1241,6 +1237,7 @@ void LlamaContext::destroy() {
 
     DESTROY(m_kernelThinFp16Attention);
     DESTROY(m_kernelThinFp16FirstRmsNorm);
+    DESTROY(m_kernelThinFp16MatMulAdd);
     DESTROY(m_kernelThinFp16RmsNorm);
 
 #undef DESTROY
@@ -1774,8 +1771,8 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                             memcpy(tensorUploadWeights + weightsOffset +  0, cbuf + block * 40 + 4, 16);
                             memcpy(tensorUploadWeights + weightsOffset + 16, cbuf + block * 40 + 24, 16);
 
-                            if (row == 1 && block < 2) {
-                                if (upload.name == "tok_embeddings.weight") {
+                            if (row == 0 && block < 2) {
+                                if (upload.name == "layers.0.attention.wq.weight") {
                                     printf("Upload %s, part %u row %u block %u\n", upload.name.c_str(), part, row, block);
                                     printf("  scales: %f %08x %f %08x\n",
                                         *(float *)(cbuf + block * 40 + 0), *(int *)(cbuf + block * 40 + 0),
@@ -1897,7 +1894,7 @@ void LlamaContext::uploadModel() {
         fflush(stderr);
     }
 
-    for (unsigned layer = 0; layer < m_numLayers; ++layer) {
+    for (unsigned layer = 0; layer < 1 /*m_numLayers*/; ++layer) {
         TensorUpload uploads[] = {
             {"layers." + std::to_string(layer) + ".attention_norm.weight", VKTYPE_F16, m_specData.nEmbd, 1,
              m_layerMemory[layer].buffer(), m_layerOffsets.attentionNorm},
@@ -1966,8 +1963,6 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
         }
     }
 
-    unsigned kernelIdx = 0;
-
     shader::GlobalConstantBuffer constants = {};
     constants.rmsEpsilon = 1e-6f;
     constants.currentRotaryPosition = 0;
@@ -1985,14 +1980,22 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
 
     // Step 2: Inference
-    const VkDescriptorSet sets[2] = {
+    const VkDescriptorSet sets[] = {
         m_dsetGlobal[m_numPasses % 2],
-        m_dsetKernel[kernelIdx % 3],
+        m_dsetLayer[0],
     };
-    vk.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 2, sets, 0, nullptr);
-
+    vk.CmdBindDescriptorSets(
+            cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout,
+            0, sizeof(sets) / sizeof(sets[0]), sets, 0, nullptr);
     vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16FirstRmsNorm);
     vk.CmdDispatch(cmdBuf, 1, 1, 1);
+
+    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Attention);
+    vk.CmdDispatch(cmdBuf, m_specData.nHead, 1, 1);
 
     vk.utilCmdPipelineMemoryBarrier(cmdBuf,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -2000,7 +2003,7 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
 
     {
         VkBufferCopy region;
-        region.srcOffset = m_globalOffsets.activations[1].offset;
+        region.srcOffset = m_globalOffsets.stage2.offset;
         region.dstOffset = m_hostOffsets.debugActivations.offset;
         region.size = 2 * m_specData.nEmbd;
 

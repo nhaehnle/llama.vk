@@ -373,6 +373,7 @@ static bool llama_model_load(
             file_info->n_vocab = hparams.n_vocab;
             file_info->n_parts = n_parts;
             file_info->n_embd = hparams.n_embd;
+            file_info->n_head = hparams.n_head;
             file_info->n_ff = n_ff;
             file_info->n_layer = hparams.n_layer;
         }

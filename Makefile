@@ -251,9 +251,10 @@ perplexity: examples/perplexity/perplexity.cpp ggml.o llama.o common.o
 	$(CXX) $(CXXFLAGS) examples/perplexity/perplexity.cpp ggml.o llama.o common.o -o perplexity $(LDFLAGS)
 
 KERNELS := \
+	KernelThinFp16Attention \
 	KernelThinFp16FirstRmsNorm \
-	KernelThinFp16RmsNorm \
-	KernelThinFp16Attention
+	KernelThinFp16MatMulAdd \
+	KernelThinFp16RmsNorm
 
 llama-vk: vulkan/llama-vk.cpp ggml.o llama.o $(KERNELS:%=vulkan/%.spv)
 	$(CXX) $(CXXFLAGS) vulkan/llama-vk.cpp ggml.o llama.o -lvulkan -o llama-vk
