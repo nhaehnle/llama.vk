@@ -665,7 +665,7 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
 void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
     uint outIdx = gid.x * NUM_THIN_MATMUL_THREADS + localTid.x;
 
-    uint numIn = specNEmbd;
+    uint numIn = specMode == 0 ? specNEmbd : specNFF;
     uint numOut = specNEmbd;
 
     // Step 1: Matrix multiply.
@@ -688,8 +688,11 @@ void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
         half2 activations[2][4][4];
         uint sub, i;
         [[unroll]] for (sub = 0; sub < 2; ++sub) {
-            // TODO: Configurable buffer for scale and weights?
-            rawWeights[sub] = bufferWo.Load<uint4>(weightsOffset + 16 * sub);
+            if (specMode == 0) {
+                rawWeights[sub] = bufferWo.Load<uint4>(weightsOffset + 16 * sub);
+            } else {
+                rawWeights[sub] = bufferW2.Load<uint4>(weightsOffset + 16 * sub);
+            }
 
             [[unroll]] for (i = 0; i < 4; ++i) {
                 [[unroll]] for (uint byte = 0; byte < 4; ++byte) {
@@ -699,7 +702,12 @@ void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
             }
         }
 
-        half2 scales = bufferWo.Load<half2>(scaleOffset);
+        half2 scales;
+        if (specMode == 0) {
+            scales = bufferWo.Load<half2>(scaleOffset);
+        } else {
+            scales = bufferW2.Load<half2>(scaleOffset);
+        }
 
         [[unroll]] for (sub = 0; sub < 2; ++sub) {
             float sum = 0;
