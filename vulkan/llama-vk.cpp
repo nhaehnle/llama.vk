@@ -1919,7 +1919,7 @@ void LlamaContext::uploadModel() {
         fflush(stderr);
     }
 
-    for (unsigned layer = 0; layer < 1 /*m_numLayers*/; ++layer) {
+    for (unsigned layer = 0; layer < m_numLayers; ++layer) {
         TensorUpload uploads[] = {
             {"layers." + std::to_string(layer) + ".attention_norm.weight", VKTYPE_F16, m_specData.nEmbd, 1,
              m_layerMemory[layer].buffer(), m_layerOffsets.attentionNorm},
@@ -2005,50 +2005,64 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_UNIFORM_READ_BIT);
 
     // Step 2: Inference
-    const VkDescriptorSet sets[] = {
-        m_dsetGlobal[m_numPasses % 2],
-        m_dsetLayer[0],
-    };
-    vk.CmdBindDescriptorSets(
-            cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout,
-            0, sizeof(sets) / sizeof(sets[0]), sets, 0, nullptr);
-    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16FirstRmsNorm);
-    vk.CmdDispatch(cmdBuf, 1, 1, 1);
+    for (unsigned layer = 0; layer < m_numLayers; ++layer) {
+        if (layer == 0) {
+            const VkDescriptorSet sets[] = {
+                m_dsetGlobal[m_numPasses % 2],
+                m_dsetLayer[0],
+            };
+            vk.CmdBindDescriptorSets(
+                    cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout,
+                    0, sizeof(sets) / sizeof(sets[0]), sets, 0, nullptr);
+            vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16FirstRmsNorm);
+            vk.CmdDispatch(cmdBuf, 1, 1, 1);
+        } else {
+            vk.CmdBindDescriptorSets(
+                    cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout,
+                    1, 1, &m_dsetLayer[layer], 0, nullptr);
+            vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16RmsNormAttention);
+            vk.CmdDispatch(cmdBuf, 1, 1, 1);
+        }
 
-    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
-    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Attention);
-    vk.CmdDispatch(cmdBuf, m_specData.nHead, 1, 1);
+        vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Attention);
+        vk.CmdDispatch(cmdBuf, m_specData.nHead, 1, 1);
 
-    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
-    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16MatMulAddAttention);
-    vk.CmdDispatch(cmdBuf, m_specData.nEmbd / NUM_THIN_MATMUL_THREADS, 1, 1);
+        vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16MatMulAddAttention);
+        vk.CmdDispatch(cmdBuf, m_specData.nEmbd / NUM_THIN_MATMUL_THREADS, 1, 1);
 
-    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
-    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16RmsNormFfn);
-    vk.CmdDispatch(cmdBuf, 1, 1, 1);
+        vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16RmsNormFfn);
+        vk.CmdDispatch(cmdBuf, 1, 1, 1);
 
-    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
-    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Ffn);
-    vk.CmdDispatch(cmdBuf, m_specData.nFF / NUM_THIN_MATMUL_THREADS, 1, 1);
+        vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Ffn);
+        vk.CmdDispatch(cmdBuf, m_specData.nFF / NUM_THIN_MATMUL_THREADS, 1, 1);
 
-    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
-    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16MatMulAddFfn);
-    vk.CmdDispatch(cmdBuf, m_specData.nFF / NUM_THIN_MATMUL_THREADS, 1, 1);
+        vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16MatMulAddFfn);
+        vk.CmdDispatch(cmdBuf, m_specData.nEmbd / NUM_THIN_MATMUL_THREADS, 1, 1);
+
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    }
 
     vk.utilCmdPipelineMemoryBarrier(cmdBuf,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
