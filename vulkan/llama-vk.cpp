@@ -900,6 +900,8 @@ struct SpecConstants {
     uint nVocab = 32000;
     uint nHead = 52;
     float rotaryTheta = 10000.0;
+
+    uint mode = 0;
 };
 static const VkSpecializationMapEntry g_specMapEntries[] = {
     { 0, offsetof(SpecConstants, nEmbd), sizeof(SpecConstants::nEmbd) },
@@ -908,6 +910,7 @@ static const VkSpecializationMapEntry g_specMapEntries[] = {
     { 3, offsetof(SpecConstants, nVocab), sizeof(SpecConstants::nVocab) },
     { 4, offsetof(SpecConstants, nHead), sizeof(SpecConstants::nHead) },
     { 5, offsetof(SpecConstants, rotaryTheta), sizeof(SpecConstants::rotaryTheta) },
+    { 10, offsetof(SpecConstants, mode), sizeof(SpecConstants::mode) },
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutGlobal[] = {
@@ -927,6 +930,10 @@ static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
     { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // Wo
     { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // key cache
     { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // value cache
+    { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // FFN norm
+    { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // W1
+    { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // W2
+    { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // W3
 };
 
 class LlamaContext {
@@ -959,7 +966,8 @@ private:
     VkPipeline m_kernelThinFp16Attention = nullptr;
     VkPipeline m_kernelThinFp16FirstRmsNorm = nullptr;
     VkPipeline m_kernelThinFp16MatMulAdd = nullptr;
-    VkPipeline m_kernelThinFp16RmsNorm = nullptr;
+    VkPipeline m_kernelThinFp16RmsNormAttention = nullptr;
+    VkPipeline m_kernelThinFp16RmsNormFFN = nullptr;
 
     VkPipelineLayout m_pipelineLayout = nullptr;
 
@@ -1055,9 +1063,13 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     LLVK_CHECK_RESULT(vk.CreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout));
 
     m_kernelThinFp16Attention = createPipeline("KernelThinFp16Attention");
+    m_specData.mode = 0;
     m_kernelThinFp16FirstRmsNorm = createPipeline("KernelThinFp16FirstRmsNorm");
     m_kernelThinFp16MatMulAdd = createPipeline("KernelThinFp16MatMulAdd");
-    m_kernelThinFp16RmsNorm = createPipeline("KernelThinFp16RmsNorm");
+    m_specData.mode = 0;
+    m_kernelThinFp16RmsNormAttention = createPipeline("KernelThinFp16RmsNorm");
+    m_specData.mode = 1;
+    m_kernelThinFp16RmsNormFFN = createPipeline("KernelThinFp16RmsNorm");
 
     // Step 2: Memory allocation
     //
@@ -1168,6 +1180,10 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
             write.writeStorage(m_dsetLayer[i], 4, m_layerMemory[i].buffer(), m_layerOffsets.Wo);
             write.writeStorage(m_dsetLayer[i], 5, m_layerMemory[i].buffer(), m_layerOffsets.cacheKeys);
             write.writeStorage(m_dsetLayer[i], 6, m_layerMemory[i].buffer(), m_layerOffsets.cacheValues);
+            write.writeStorage(m_dsetLayer[i], 7, m_layerMemory[i].buffer(), m_layerOffsets.ffnNorm);
+            write.writeStorage(m_dsetLayer[i], 8, m_layerMemory[i].buffer(), m_layerOffsets.W1);
+            write.writeStorage(m_dsetLayer[i], 9, m_layerMemory[i].buffer(), m_layerOffsets.W2);
+            write.writeStorage(m_dsetLayer[i], 10, m_layerMemory[i].buffer(), m_layerOffsets.W3);
         }
 
         write.commit();
@@ -1238,7 +1254,8 @@ void LlamaContext::destroy() {
     DESTROY(m_kernelThinFp16Attention);
     DESTROY(m_kernelThinFp16FirstRmsNorm);
     DESTROY(m_kernelThinFp16MatMulAdd);
-    DESTROY(m_kernelThinFp16RmsNorm);
+    DESTROY(m_kernelThinFp16RmsNormAttention);
+    DESTROY(m_kernelThinFp16RmsNormFFN);
 
 #undef DESTROY
 }
@@ -1999,11 +2016,25 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
 
     vk.utilCmdPipelineMemoryBarrier(cmdBuf,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16MatMulAdd);
+    vk.CmdDispatch(cmdBuf, m_specData.nEmbd / NUM_THIN_MATMUL_THREADS, 1, 1);
+
+    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+    vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16RmsNormFFN);
+    vk.CmdDispatch(cmdBuf, 1, 1, 1);
+
+    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
     {
         VkBufferCopy region;
-        region.srcOffset = m_globalOffsets.stage2.offset;
+        region.srcOffset = m_globalOffsets.stage1.offset;
         region.dstOffset = m_hostOffsets.debugActivations.offset;
         region.size = 2 * m_specData.nEmbd;
 

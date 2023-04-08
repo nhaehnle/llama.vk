@@ -30,6 +30,7 @@ enum WeightFormat {
 [[vk::constant_id(3)]] const uint specNVocab = 32000; // all LLaMas
 [[vk::constant_id(4)]] const uint specNHead = 52; // LLaMa 30B
 [[vk::constant_id(5)]] const float specRotaryTheta = 10000.0;
+[[vk::constant_id(10)]] const uint specMode = 0; // meaning depends on the kernel
 
 [[vk::binding(0, 0)]] cbuffer ForwardPassConstants {
     GlobalConstantBuffer g_constants;
@@ -50,6 +51,11 @@ enum WeightFormat {
 
 [[vk::binding(5, 1)]] RWByteAddressBuffer bufferKeys;
 [[vk::binding(6, 1)]] RWByteAddressBuffer bufferValues;
+
+[[vk::binding(7, 1)]] ByteAddressBuffer bufferFfnNorm;
+[[vk::binding(8, 1)]] ByteAddressBuffer bufferW1;
+[[vk::binding(9, 1)]] ByteAddressBuffer bufferW2;
+[[vk::binding(10, 1)]] ByteAddressBuffer bufferW3;
 
 #define NUM_WGP_THREADS 256 // multiple of a wave size!
 
@@ -111,10 +117,17 @@ void storeNormActivations(uint tid, uint numThreads, uint numPerLane, half2 acti
         offset = 2 * numPerLane * tid;
 
     [[unroll]] for (idx = 0; idx + 4 <= numPerLane / 2; idx += 4) {
-        activations[idx + 0] *= bufferAttentionNorm.Load<half2>(offset + 0);
-        activations[idx + 1] *= bufferAttentionNorm.Load<half2>(offset + 4);
-        activations[idx + 2] *= bufferAttentionNorm.Load<half2>(offset + 8);
-        activations[idx + 3] *= bufferAttentionNorm.Load<half2>(offset + 12);
+        if (specMode == 0) {
+            activations[idx + 0] *= bufferAttentionNorm.Load<half2>(offset + 0);
+            activations[idx + 1] *= bufferAttentionNorm.Load<half2>(offset + 4);
+            activations[idx + 2] *= bufferAttentionNorm.Load<half2>(offset + 8);
+            activations[idx + 3] *= bufferAttentionNorm.Load<half2>(offset + 12);
+        } else {
+            activations[idx + 0] *= bufferFfnNorm.Load<half2>(offset + 0);
+            activations[idx + 1] *= bufferFfnNorm.Load<half2>(offset + 4);
+            activations[idx + 2] *= bufferFfnNorm.Load<half2>(offset + 8);
+            activations[idx + 3] *= bufferFfnNorm.Load<half2>(offset + 12);
+        }
         if (swizzled)
             offset += numThreads * 16;
         else
@@ -124,7 +137,11 @@ void storeNormActivations(uint tid, uint numThreads, uint numPerLane, half2 acti
     if (swizzled)
         offset = 2 * idx * numThreads + 4 * tid;
     [[unroll]] for (; idx < numPerLane / 2; ++idx) {
-        activations[idx] *= bufferAttentionNorm.Load<half2>(offset);
+        if (specMode == 0) {
+            activations[idx] *= bufferAttentionNorm.Load<half2>(offset);
+        } else {
+            activations[idx] *= bufferFfnNorm.Load<half2>(offset);
+        }
         if (swizzled)
             offset += numThreads * 4;
         else
@@ -644,17 +661,15 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
     }
 }
 
-#define NUM_THIN_MATMULRMS_THREADS 128
-
 // Matrix-vector multiply-add with Q4_0_SWZ matrix.
 //
 // Every lane computes a single output element.
 //
 // TODO: Use specialization constants or push constants?
 // TODO: Target wave32 in WGP mode
-[numthreads(NUM_THIN_MATMULRMS_THREADS, 1, 1)]
+[numthreads(NUM_THIN_MATMUL_THREADS, 1, 1)]
 void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
-    uint outIdx = gid.x * NUM_THIN_MATMULRMS_THREADS + localTid.x;
+    uint outIdx = gid.x * NUM_THIN_MATMUL_THREADS + localTid.x;
 
     uint numIn = specNEmbd;
     uint numOut = specNEmbd;

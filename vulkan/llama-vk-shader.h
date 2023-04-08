@@ -6,6 +6,8 @@ namespace shader {
 using uint = uint32_t;
 #endif
 
+#define NUM_THIN_MATMUL_THREADS 128
+
 struct GlobalConstantBuffer {
     float rmsEpsilon;
     uint currentRotaryPosition;
