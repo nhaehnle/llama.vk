@@ -920,6 +920,10 @@ static const VkDescriptorSetLayoutBinding g_dsetLayoutGlobal[] = {
     { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations bypass
     { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage1
     { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage2
+    { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // model norm
+    { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // model output
+    { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // output scratch
+    { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // result
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
@@ -945,7 +949,7 @@ public:
 
     void uploadModel();
 
-    void process(const llama_token *token, size_t numTokens);
+    llama_token process(const llama_token *token, size_t numTokens);
 
 private:
     struct WriteHistoryIndex {
@@ -955,7 +959,7 @@ private:
 
     void submitPass(const shader::GlobalConstantBuffer &constants,
                     const WriteHistoryIndex &writeHistory,
-                    bool debug);
+                    bool debug, llama_token *output);
 
     VkDescriptorSetLayout createDescriptorSetLayoutImpl(const VkDescriptorSetLayoutBinding *bindings, size_t count);
     template <int N>
@@ -977,8 +981,10 @@ private:
     VkPipeline m_kernelThinFp16FirstRmsNorm = nullptr;
     VkPipeline m_kernelThinFp16MatMulAddAttention = nullptr;
     VkPipeline m_kernelThinFp16MatMulAddFfn = nullptr;
+    VkPipeline m_kernelThinFp16Output = nullptr;
     VkPipeline m_kernelThinFp16RmsNormAttention = nullptr;
     VkPipeline m_kernelThinFp16RmsNormFfn = nullptr;
+    VkPipeline m_kernelThinFp16RmsNormOutput = nullptr;
 
     VkPipelineLayout m_pipelineLayout = nullptr;
 
@@ -996,6 +1002,10 @@ private:
         Range constants[2];
         Range historyIndex;
         Range embedding;
+        Range modelNorm;
+        Range modelOutput;
+        Range outputScratch;
+        Range result;
         Range bypass;
         Range stage1;
         Range stage2;
@@ -1020,6 +1030,7 @@ private:
 
     struct {
         uint64_t size = 0;
+        Range result;
         Range debugActivations;
     } m_hostOffsets;
     MemoryAndBuffer m_hostMemory;
@@ -1067,6 +1078,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     m_specData.nEmbd = fileInfo.n_embd;
     m_specData.nFF = fileInfo.n_ff;
     m_specData.nHead = fileInfo.n_head;
+    m_specData.nVocab = fileInfo.n_vocab;
 
     // Step 1: Descriptor set and pipeline layouts and pipelines
     m_specInfo.mapEntryCount = sizeof(g_specMapEntries) / sizeof(g_specMapEntries[0]);
@@ -1096,10 +1108,13 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
     m_kernelThinFp16MatMulAddAttention = createPipeline("KernelThinFp16MatMulAdd");
     m_specData.mode = 1;
     m_kernelThinFp16MatMulAddFfn = createPipeline("KernelThinFp16MatMulAdd");
+    m_kernelThinFp16Output = createPipeline("KernelThinFp16Output");
     m_specData.mode = 0;
     m_kernelThinFp16RmsNormAttention = createPipeline("KernelThinFp16RmsNorm");
     m_specData.mode = 1;
     m_kernelThinFp16RmsNormFfn = createPipeline("KernelThinFp16RmsNorm");
+    m_specData.mode = 2;
+    m_kernelThinFp16RmsNormOutput = createPipeline("KernelThinFp16RmsNorm");
 
     // Step 2: Memory allocation
     //
@@ -1137,10 +1152,15 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
         uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_numVocab);
         OFFSET(m_globalOffsets, embedding, embdMatrixSize);
+        OFFSET(m_globalOffsets, modelNorm, 2 * m_specData.nEmbd);
+        OFFSET(m_globalOffsets, modelOutput, embdMatrixSize);
+
+        OFFSET(m_globalOffsets, outputScratch, sizeof(shader::OutputScratch));
+        OFFSET(m_globalOffsets, result, sizeof(shader::ResultBuffer));
 
         OFFSET(m_globalOffsets, bypass, 2 * m_specData.nEmbd);
         OFFSET(m_globalOffsets, stage1, 2 * m_specData.nEmbd);
-        OFFSET(m_globalOffsets, stage2, 2 * m_specData.nFF); // can hold both nEmbd and nFF
+        OFFSET(m_globalOffsets, stage2, 4 * m_specData.nVocab); // can hold nEmbd, nFF, and the output pool
 
         printf("vulkan: allocating %s of device memory\n",
                formatNumBytes(m_globalOffsets.size + m_numLayers * m_layerOffsets.size).c_str());
@@ -1156,6 +1176,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
             m_layerMemory.push_back(std::move(memory));
         }
 
+        OFFSET(m_hostOffsets, result, sizeof(shader::ResultBuffer));
         OFFSET(m_hostOffsets, debugActivations, 2 * m_specData.nFF);
         m_hostMemory = device.allocateHost(m_hostOffsets.size);
         if (!m_hostMemory.valid())
@@ -1200,6 +1221,10 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
             write.writeStorage(m_dsetGlobal[i], 3, m_globalMemory.buffer(), m_globalOffsets.bypass);
             write.writeStorage(m_dsetGlobal[i], 4, m_globalMemory.buffer(), m_globalOffsets.stage1);
             write.writeStorage(m_dsetGlobal[i], 5, m_globalMemory.buffer(), m_globalOffsets.stage2);
+            write.writeStorage(m_dsetGlobal[i], 6, m_globalMemory.buffer(), m_globalOffsets.modelNorm);
+            write.writeStorage(m_dsetGlobal[i], 7, m_globalMemory.buffer(), m_globalOffsets.modelOutput);
+            write.writeStorage(m_dsetGlobal[i], 8, m_globalMemory.buffer(), m_globalOffsets.outputScratch);
+            write.writeStorage(m_dsetGlobal[i], 9, m_globalMemory.buffer(), m_globalOffsets.result);
         }
 
         for (unsigned i = 0; i < m_numLayers; ++i) {
@@ -1286,8 +1311,10 @@ void LlamaContext::destroy() {
     DESTROY(m_kernelThinFp16FirstRmsNorm);
     DESTROY(m_kernelThinFp16MatMulAddAttention);
     DESTROY(m_kernelThinFp16MatMulAddFfn);
+    DESTROY(m_kernelThinFp16Output);
     DESTROY(m_kernelThinFp16RmsNormAttention);
     DESTROY(m_kernelThinFp16RmsNormFfn);
+    DESTROY(m_kernelThinFp16RmsNormOutput);
 
 #undef DESTROY
 }
@@ -1695,11 +1722,6 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                     queueTransfer.size = region.size;
                     m_queueTransfers.push_back(queueTransfer);
                 }
-
-                // VkDependencyInfo dependencyInfo = {};
-                // dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-
-                // ctx.vk.CmdPipelineBarrier2(cmdBuf, &dependencyInfo);
             }
 
             currentDstBuffer = nullptr;
@@ -1709,6 +1731,25 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
         for (unsigned idx = 0; idx < numUploads; ++idx) {
             const TensorUpload &upload = uploads[idx];
             assert(uploadOffset + upload.range.range <= m_maxUploadSize);
+
+            if (upload.name.empty()) {
+                // Zero-initialize
+                ctx.vk.CmdFillBuffer(cmdBuf, upload.buffer, upload.range.offset, upload.range.range, 0);
+
+                VkBufferMemoryBarrier2 queueTransfer = {};
+                queueTransfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+                queueTransfer.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                queueTransfer.srcAccessMask = 0;
+                queueTransfer.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                queueTransfer.dstAccessMask = 0;
+                queueTransfer.srcQueueFamilyIndex = ctx.device.transferQueueFamily();
+                queueTransfer.dstQueueFamilyIndex = ctx.device.computeQueueFamily();
+                queueTransfer.buffer = upload.buffer;
+                queueTransfer.offset = upload.range.offset;
+                queueTransfer.size = upload.range.range;
+                m_queueTransfers.push_back(queueTransfer);
+                continue;
+            }
 
             auto tensorIt = m_tensors.find(upload.name);
             if (tensorIt == m_tensors.end()) {
@@ -1935,7 +1976,7 @@ void LlamaContext::uploadModel() {
     // in parallel with prompt processing, would be interesting.
     {
         TensorUpload uploads[] = {
-            {"tok_embeddings.weight", VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_numVocab,
+            {"tok_embeddings.weight", VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_specData.nVocab,
              m_globalMemory.buffer(), m_globalOffsets.embedding},
         };
         m_uploader->upload(uploads);
@@ -1963,6 +2004,19 @@ void LlamaContext::uploadModel() {
              m_layerMemory[layer].buffer(), m_layerOffsets.W2},
             {"layers." + std::to_string(layer) + ".feed_forward.w3.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nFF,
              m_layerMemory[layer].buffer(), m_layerOffsets.W3},
+        };
+        m_uploader->upload(uploads);
+        fprintf(stderr, ".");
+        fflush(stderr);
+    }
+
+    {
+        TensorUpload uploads[] = {
+            {"norm.weight", VKTYPE_F16, m_specData.nEmbd, 1,
+             m_globalMemory.buffer(), m_globalOffsets.modelNorm},
+            {"output.weight", VKTYPE_Q4_0_SWZ, m_specData.nEmbd, m_specData.nVocab,
+             m_globalMemory.buffer(), m_globalOffsets.modelOutput},
+            {"", -1, 0, 0, m_globalMemory.buffer(), m_globalOffsets.outputScratch},
         };
         m_uploader->upload(uploads);
         fprintf(stderr, ".");
@@ -2009,7 +2063,10 @@ void LlamaContext::CommandBuffer::init(LlamaContext &ctx_) {
     LLVK_CHECK_RESULT(ctx->vk.CreateEvent(ctx->device, &createInfo, nullptr, &historyWarEvent));
 }
 
-void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, const WriteHistoryIndex &writeHistory, bool debug) {
+void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, const WriteHistoryIndex &writeHistory,
+                              bool debug, llama_token *output) {
+    assert(!debug || !output);
+
     if (m_numSubmits >= 2)
         m_semaphore.waitForever(m_numSubmits - 1);
 
@@ -2095,6 +2152,9 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
         if (layer == m_numLayers - 1) {
             // Signal the event after the last user of the history index.
             setHistoryEvent();
+
+            if (!output)
+                break;
         }
 
         vk.utilCmdPipelineMemoryBarrier(cmdBuf,
@@ -2140,11 +2200,32 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
                        m_globalOffsets.historyIndex.offset + 4 * writeHistory.historyIndex,
                        4, &writeHistory.storageIndex);
 
-    vk.utilCmdPipelineMemoryBarrier(cmdBuf,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    if (output) {
+        vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16RmsNormOutput);
+        vk.CmdDispatch(cmdBuf, 1, 1, 1);
 
-    if (debug) {
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+        vk.CmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_kernelThinFp16Output);
+        vk.CmdDispatch(cmdBuf, m_specData.nVocab / NUM_OUTPUT_THREADS, 1, 1);
+    }
+
+    if (debug || output) {
+        vk.utilCmdPipelineMemoryBarrier(cmdBuf,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    }
+
+    if (output) {
+        VkBufferCopy region;
+        region.srcOffset = m_globalOffsets.result.offset;
+        region.dstOffset = m_hostOffsets.result.offset;
+        region.size = sizeof(shader::ResultBuffer);
+
+        vk.CmdCopyBuffer(cmdBuf, m_globalMemory.buffer(), m_hostMemory.buffer(), 1, &region);
+    } else if (debug) {
         VkBufferCopy region;
         region.srcOffset = m_globalOffsets.stage2.offset;
         region.dstOffset = m_hostOffsets.debugActivations.offset;
@@ -2183,7 +2264,18 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
     LLVK_CHECK_RESULT(vk.QueueSubmit2(device.computeQueue(), 1, &submitInfo, nullptr));
 
     // Step 4: Dump debug activations.
-    if (debug) {
+    if (output) {
+        m_semaphore.waitForever(m_numSubmits);
+
+        auto *result =
+                reinterpret_cast<shader::ResultBuffer *>(
+                    m_hostMemory.map(m_hostOffsets.result.offset,
+                                     m_hostOffsets.result.range));
+
+        *output = result->token;
+
+        m_hostMemory.unmap();
+    } else if (debug) {
         m_semaphore.waitForever(m_numSubmits);
 
         void *activations =
@@ -2202,14 +2294,19 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
     }
 }
 
-void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
+llama_token LlamaContext::process(const llama_token *tokens, size_t numTokens) {
     shader::GlobalConstantBuffer constants = {};
     constants.rmsEpsilon = 1e-6f;
     constants.currentHistoryBase = 0;
     constants.numKeyValueEntries = m_maxCacheEntries;
+    constants.topK = 40;
+    constants.topP = 0.95;
+    constants.temp = 0.8;
+    constants.rand = 0.0; // TODO
 
     unsigned historyGroup = constants.currentHistoryBase / m_specData.nCtx;
 
+    llama_token token = 0;
     for (size_t idx = 0; idx < numTokens; ++idx) {
         constants.currentToken = tokens[idx];
         constants.currentRotaryPosition = idx;
@@ -2222,10 +2319,10 @@ void LlamaContext::process(const llama_token *tokens, size_t numTokens) {
         writeHistory.storageIndex = constants.currentStorageIndex;
 
         bool debug = false;
-        submitPass(constants, writeHistory, debug);
-        if (debug)
-            break;
+        submitPass(constants, writeHistory, debug, idx == numTokens - 1 ? &token : nullptr);
     }
+
+    return token;
 }
 
 } // namespace llvk
@@ -2450,7 +2547,8 @@ int main(int argc, char **argv) {
         printf("  %u: '%s'\n", token, llama_token_to_str(ctx, token));
     printf("--\n");
 
-    vkctx.process(embd_inp.data(), embd_inp.size());
+    llama_token next = vkctx.process(embd_inp.data(), embd_inp.size());
+    printf("  %u: '%s'\n", next, llama_token_to_str(ctx, next));
 
     return 0;
 }

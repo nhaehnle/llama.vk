@@ -8,22 +8,25 @@
 
 #define DEBUG_FIRST_RMS_NORM 0
 #define DEBUG_ATTENTION 0
-#define DEBUG_ASSERTIONS 1
+#define DEBUG_OUTPUT 1
+#define DEBUG_ASSERTIONS 0
 
 
 #if DEBUG_ASSERTIONS
-#define assert(cond) do { } while (false)
-#else
 #define assert(cond) \
     do { \
         if (!(cond)) \
             printf("assert failed at %s:%d: %s", __FILE__, __LINE__, #cond); \
     } while (false)
+#else
+#define assert(cond) do { } while (false)
 #endif
 
-enum WeightFormat {
-    WeightFormatQ4_0gpu = 2,
-};
+[[vk::ext_instruction(/* OpBitcast */ 124)]]
+uint16_t asuint16(half x);
+
+[[vk::ext_instruction(/* OpBitcast */ 124)]]
+half ashalf(uint16_t x);
 
 [[vk::constant_id(0)]] const uint specNEmbd = 6656; // LLaMa 30B
 [[vk::constant_id(1)]] const uint specNCtx = 2048; // all LLaMas
@@ -43,6 +46,12 @@ enum WeightFormat {
 [[vk::binding(3, 0)]] RWByteAddressBuffer bufferBypass;
 [[vk::binding(4, 0)]] RWByteAddressBuffer bufferStage1;
 [[vk::binding(5, 0)]] RWByteAddressBuffer bufferStage2;
+
+[[vk::binding(6, 0)]] ByteAddressBuffer bufferModelNorm;
+[[vk::binding(7, 0)]] ByteAddressBuffer bufferModelOutput;
+
+[[vk::binding(8, 0)]] RWStructuredBuffer<OutputScratch> bufferOutputScratch;
+[[vk::binding(9, 0)]] RWStructuredBuffer<ResultBuffer> bufferResult;
 
 [[vk::binding(0, 1)]] ByteAddressBuffer bufferAttentionNorm;
 [[vk::binding(1, 1)]] ByteAddressBuffer bufferWq;
@@ -97,8 +106,8 @@ void rmsNormBottomHalf(uint tid, uint numThreads, uint numPerLane, inout half2 a
     // Write activations out to memory
     half scale = half(1.0 / sqrt(g_constants.rmsEpsilon + mean));
 
-    if (tid == 0)
-        printf("RMS scale: %f\n", (float)scale);
+    // if (tid == 0)
+    //     printf("RMS scale: %f\n", (float)scale);
 
     [[unroll]] for (uint idx = 0; idx < numPerLane / 2; ++idx)
         activations[idx] *= scale;
@@ -123,11 +132,16 @@ void storeNormActivations(uint tid, uint numThreads, uint numPerLane, half2 acti
             activations[idx + 1] *= bufferAttentionNorm.Load<half2>(offset + 4);
             activations[idx + 2] *= bufferAttentionNorm.Load<half2>(offset + 8);
             activations[idx + 3] *= bufferAttentionNorm.Load<half2>(offset + 12);
-        } else {
+        } else if (specMode == 1) {
             activations[idx + 0] *= bufferFfnNorm.Load<half2>(offset + 0);
             activations[idx + 1] *= bufferFfnNorm.Load<half2>(offset + 4);
             activations[idx + 2] *= bufferFfnNorm.Load<half2>(offset + 8);
             activations[idx + 3] *= bufferFfnNorm.Load<half2>(offset + 12);
+        } else {
+            activations[idx + 0] *= bufferModelNorm.Load<half2>(offset + 0);
+            activations[idx + 1] *= bufferModelNorm.Load<half2>(offset + 4);
+            activations[idx + 2] *= bufferModelNorm.Load<half2>(offset + 8);
+            activations[idx + 3] *= bufferModelNorm.Load<half2>(offset + 12);
         }
         if (swizzled)
             offset += numThreads * 16;
@@ -140,8 +154,10 @@ void storeNormActivations(uint tid, uint numThreads, uint numPerLane, half2 acti
     [[unroll]] for (; idx < numPerLane / 2; ++idx) {
         if (specMode == 0) {
             activations[idx] *= bufferAttentionNorm.Load<half2>(offset);
-        } else {
+        } else if (specMode == 1) {
             activations[idx] *= bufferFfnNorm.Load<half2>(offset);
+        } else {
+            activations[idx] *= bufferModelNorm.Load<half2>(offset);
         }
         if (swizzled)
             offset += numThreads * 4;
@@ -679,18 +695,26 @@ void KernelThinFp16Attention(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
     }
 }
 
-// Matrix-vector multiply-add with Q4_0_SWZ matrix.
+// Multiply-add of vector with matrix.
 //
-// Every lane computes a single output element.
-//
-// TODO: Use specialization constants or push constants?
-// TODO: Target wave32 in WGP mode
-[numthreads(NUM_THIN_MATMUL_THREADS, 1, 1)]
-void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
-    uint outIdx = gid.x * NUM_THIN_MATMUL_THREADS + localTid.x;
+// mode selects the matrix:
+//  0 -> Wo
+//  1 -> W2
+//  2 -> output
+float thinMatMul(uint mode, uint outIdx, float accum) {
+    uint numIn;
+    uint numOut;
 
-    uint numIn = specMode == 0 ? specNEmbd : specNFF;
-    uint numOut = specNEmbd;
+    if (mode == 0) {
+        numIn = specNEmbd;
+        numOut = specNEmbd;
+    } else if (mode == 1) {
+        numIn = specNFF;
+        numOut = specNEmbd;
+    } else {
+        numIn = specNEmbd;
+        numOut = specNVocab;
+    }
 
     // Step 1: Matrix multiply.
     // Assume Q4_0_SWZ format.
@@ -702,35 +726,39 @@ void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
     uint weightsOffset = matrixScaleBytes + outIdx * 32;
     uint weightsStride = numOut * 32;
 
-    // NOTE: Can only load at offsets that are a multiple of 4 :(
-    half2 prev = bufferBypass.Load<half2>(4 * (outIdx / 2));
-    float result = prev[outIdx % 2];
-
     uint inOffset = 0;
     for (uint blockIdx = 0; blockIdx < nDoubleBlocks; ++blockIdx) {
         uint4 rawWeights[2];
         half2 activations[2][4][4];
         uint sub, i;
         [[unroll]] for (sub = 0; sub < 2; ++sub) {
-            if (specMode == 0) {
+            if (mode == 0) {
                 rawWeights[sub] = bufferWo.Load<uint4>(weightsOffset + 16 * sub);
-            } else {
+            } else if (mode == 1) {
                 rawWeights[sub] = bufferW2.Load<uint4>(weightsOffset + 16 * sub);
+            } else {
+                rawWeights[sub] = bufferModelOutput.Load<uint4>(weightsOffset + 16 * sub);
             }
 
             [[unroll]] for (i = 0; i < 4; ++i) {
                 [[unroll]] for (uint byte = 0; byte < 4; ++byte) {
-                    activations[sub][i][byte] = bufferStage2.Load<half2>(inOffset);
+                    if (mode <= 1) {
+                        activations[sub][i][byte] = bufferStage2.Load<half2>(inOffset);
+                    } else {
+                        activations[sub][i][byte] = bufferStage1.Load<half2>(inOffset);
+                    }
                     inOffset += 4;
                 }
             }
         }
 
         half2 scales;
-        if (specMode == 0) {
+        if (mode == 0) {
             scales = bufferWo.Load<half2>(scaleOffset);
-        } else {
+        } else if (mode == 1) {
             scales = bufferW2.Load<half2>(scaleOffset);
+        } else {
+            scales = bufferModelOutput.Load<half2>(scaleOffset);
         }
 
         [[unroll]] for (sub = 0; sub < 2; ++sub) {
@@ -751,12 +779,33 @@ void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupTh
                 }
             }
 
-            result += scales[sub] * sum;
+            accum += scales[sub] * sum;
         }
 
         scaleOffset += scaleStride;
         weightsOffset += weightsStride;
     }
+
+    return accum;
+}
+
+// Matrix-vector multiply-add with Q4_0_SWZ matrix.
+//
+// Every lane computes a single output element.
+//
+// TODO: Use specialization constants or push constants?
+// TODO: Target wave32 in WGP mode
+[numthreads(NUM_THIN_MATMUL_THREADS, 1, 1)]
+void KernelThinFp16MatMulAdd(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
+    uint outIdx = gid.x * NUM_THIN_MATMUL_THREADS + localTid.x;
+
+    // Step 1: Matrix multiply.
+    //
+    // NOTE: Can only load at offsets that are a multiple of 4 :(
+    half2 prev = bufferBypass.Load<half2>(4 * (outIdx / 2));
+    float result = prev[outIdx % 2];
+
+    result = thinMatMul(specMode, outIdx, result);
 
     // NOTE: Can only store at offsets that are a multiple of 4 :(
     //
@@ -866,4 +915,450 @@ void KernelThinFp16Ffn(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID
         half2 data = half2(result, otherResult);
         bufferStage2.Store<half2>(4 * (outIdx / 2), data);
     }
+}
+
+#define NUM_OUTPUT_LOCAL_POOL 2047
+
+groupshared struct {
+    Histogram histogram[2]; // 2kB
+    uint pool1[NUM_OUTPUT_LOCAL_POOL + 1]; // 8kB
+    uint pool2[NUM_OUTPUT_LOCAL_POOL + 1]; // 8kB
+    uint topKUpperBound;
+    uint tmp1;
+    uint tmp2;
+} g_output;
+
+uint histogramIndex(uint key) {
+    // key is at most 255
+    return key ^ (key >> 3);
+}
+
+uint encodeOutput(uint token, float weight) {
+    uint x = (uint)asuint16((half)weight) << 16;
+    if ((x & 0x80000000) == 0)
+        x ^= 0x7fff0000;
+    return x | token;
+}
+
+void decodeOutput(uint x, out uint token, out float weight) {
+    token = x & 0xffff;
+    if ((x & 0x80000000) == 0)
+        x ^= 0x7fff0000;
+    weight = ashalf((uint16_t)(x >> 16));
+}
+
+void processHistogram(uint hist, uint waveId, bool topK, bool accumulate, bool debug) {
+    uint lane = WaveGetLaneIndex();
+    uint waveSize = WaveGetLaneCount();
+    uint numWaves = NUM_OUTPUT_THREADS / waveSize;
+    uint wave;
+
+    if (waveId == 0) {
+        uint numWaves = 256 / waveSize;
+        uint laneBuckets[16]; // ATTN: Assume waveSize >= 16
+        uint laneAccum = 0;
+
+        [[unroll]] for (wave = 0; wave < numWaves; ++wave) {
+            laneBuckets[wave] = g_output.histogram[hist].bucket[histogramIndex(lane * numWaves + wave)];
+            laneAccum += laneBuckets[wave];
+        }
+
+        uint lanePrefix = WavePrefixSum(laneAccum);
+
+        if (debug) {
+            printf("histogram lane: %2u lanePrefix: %5u buckets: %4u %4u %4u %4u\n",
+                lane, lanePrefix,
+                laneBuckets[0], laneBuckets[1], laneBuckets[2], laneBuckets[3]);
+        }
+
+        if (accumulate) {
+            uint accum = lanePrefix;
+            [[unroll]] for (wave = 0; wave < numWaves; ++wave) {
+                g_output.histogram[hist].bucket[histogramIndex(lane * numWaves + wave)] = accum;
+                accum += laneBuckets[wave];
+            }
+        }
+
+        if (topK) {
+            bool someAccepted = lanePrefix < g_constants.topK;
+            uint maxLane = WaveActiveCountBits(someAccepted) - 1;
+
+            lanePrefix = WaveReadLaneAt(lanePrefix, maxLane);
+
+            uint maxSub = 0;
+            [[unroll]] for (wave = 0; wave < numWaves - 1; ++wave) {
+                lanePrefix += WaveReadLaneAt(laneBuckets[wave], maxLane);
+                maxSub = lanePrefix < g_constants.topK ? wave + 1 : maxSub;
+            }
+
+            g_output.topKUpperBound = ((maxLane * numWaves + maxSub + 1) << 24) - 1;
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+}
+
+void loadFromGlobalPool(uint tid, uint numGroups, inout uint base, uint globalPoolSize,
+                        uint topKUpperBound, uint numInbounds, uint maxBoundary) {
+    uint lane = WaveGetLaneIndex();
+
+    for (base = 0; base < globalPoolSize; base += numGroups * NUM_OUTPUT_THREADS) {
+        uint group;
+        uint entries[4];
+        bool inbounds[4];
+
+        uint curBase = min(base + tid * numGroups, (globalPoolSize / numGroups) * numGroups);
+        [[unroll]] for (group = 0; group < numGroups; ++group) {
+            entries[group] = bufferStage2.Load<uint>(4 * (curBase + group));
+            inbounds[group] = curBase + group < globalPoolSize;
+        }
+
+        bool boundary[4];
+        uint prefixBoundary[4];
+        uint numBoundary = 0;
+        [[unroll]] for (group = 0; group < numGroups; ++group) {
+            inbounds[group] = inbounds[group] &&
+                              entries[group] <= topKUpperBound;
+            boundary[group] = inbounds[group] &&
+                              entries[group] >= (topKUpperBound & 0xff000000);
+            prefixBoundary[group] = numBoundary + WavePrefixCountBits(boundary[group]);
+            numBoundary += WaveActiveCountBits(boundary[group]);
+        }
+
+        if (numBoundary) {
+            uint preBoundary;
+            if (lane == 0) {
+                InterlockedAdd(g_output.tmp2, numBoundary, preBoundary);
+            }
+            preBoundary = WaveReadLaneAt(preBoundary, 0);
+
+            [[unroll]] for (group = 0; group < numGroups; ++group) {
+                prefixBoundary[group] += preBoundary;
+                inbounds[group] = inbounds[group] && (!boundary[group] || prefixBoundary[group] < maxBoundary);
+            }
+        }
+
+        uint prefixInbounds[4];
+        uint numInbounds = 0;
+        [[unroll]] for (group = 0; group < numGroups; ++group) {
+            prefixInbounds[group] = numInbounds + WavePrefixCountBits(inbounds[group]);
+            numInbounds += WaveActiveCountBits(inbounds[group]);
+        }
+
+        if (!numInbounds)
+            continue;
+
+        uint preInbounds;
+        if (lane == 0) {
+            InterlockedAdd(g_output.tmp1, numInbounds, preInbounds);
+        }
+        preInbounds = WaveReadLaneAt(preInbounds, 0);
+
+        [[unroll]] for (group = 0; group < numGroups; ++group) {
+            prefixInbounds[group] += preInbounds;
+            prefixInbounds[group] = inbounds[group] ? prefixInbounds[group] : NUM_OUTPUT_LOCAL_POOL;
+            g_output.pool1[prefixInbounds[group]] = entries[group];
+        }
+
+        // TODO: This doesn't work with numGroups != 1. Compiler / driver bug?!?
+        [[unroll]] for (group = 0; group < numGroups; ++group) {
+            if (inbounds[group]) {
+                uint idx = histogramIndex((entries[group] >> 16) & 0xff);
+                uint noReturn;
+                // printf("tid: %u group %u histogram key: %u\n", tid, group, (entries[group] >> 16) & 0xff);
+                InterlockedAdd(g_output.histogram[1].bucket[idx], 1, noReturn);
+            }
+        }
+    }
+}
+
+// Output kernel. This does:
+//
+//  * output multiply (one token per thread)
+//  * top-K sampling (at most 256)
+//  * softmax
+//  * sort + top-p cut-off
+//  * sample
+//
+// The idea is that the result can be fed back directly to the next pass without
+// going to the CPU.
+//
+// This kernel starts out with one thread per token and then narrows to a single
+// workgroup that is chosen dynamically.
+[numthreads(NUM_OUTPUT_THREADS, 1, 1)]
+void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
+    uint tid = localTid.x;
+    uint lane = WaveGetLaneIndex();
+    uint waveSize = WaveGetLaneCount();
+    uint waveId = tid / waveSize;
+
+    g_output.histogram[0].bucket[tid] = 0;
+    g_output.histogram[1].bucket[tid] = 0;
+    g_output.tmp1 = 0;
+    g_output.tmp2 = 0;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Step 1: Multiply with output matrix and build local histogram.
+    uint output;
+    {
+        uint token = NUM_OUTPUT_THREADS * gid.x + tid;
+        float weight = thinMatMul(2, token, 0);
+
+        output = encodeOutput(token, weight);
+
+        uint noReturn;
+        InterlockedAdd(g_output.histogram[0].bucket[histogramIndex(output >> 24)], 1, noReturn);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Step 2: Accumulate local histogram to global histogram.
+    {
+        uint our = g_output.histogram[0].bucket[tid];
+        uint pre;
+        InterlockedAdd(bufferOutputScratch[0].histogram.bucket[tid], our, pre);
+        g_output.histogram[1].bucket[tid] = our + pre;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Step 3: Filter entries and write them to the global pool
+    {
+        processHistogram(1, waveId, /* topK */ true, /* accumulate */ true, /* debug */ false);
+        uint topKUpperBound = g_output.topKUpperBound;
+
+        bool isLive = output <= topKUpperBound;
+        uint count = WaveActiveCountBits(isLive);
+        uint relIdx = WavePrefixCountBits(isLive);
+
+        {
+            uint waveRelIdx;
+            if (lane == 0)
+                InterlockedAdd(g_output.tmp1, count, waveRelIdx);
+            relIdx += WaveReadLaneAt(waveRelIdx, 0);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid == 0) {
+            uint numInbounds = g_output.tmp1;
+            uint groupIdx;
+            InterlockedAdd(bufferOutputScratch[0].poolSize, numInbounds, groupIdx);
+            g_output.tmp1 = groupIdx;
+
+            // printf("gid: %u numInbounds: %u groupIdx: %u topKUpperBound: %8x\n", gid.x,
+            //        numInbounds, groupIdx, topKUpperBound);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        relIdx += g_output.tmp1;
+
+        // if (gid.x == 0) {
+        //     printf("tid: %u relIdx: %u isLive: %u output: %8x\n", tid, relIdx, isLive, output);
+        // }
+
+        if (isLive) {
+            bufferStage2.Store(4 * relIdx, output);
+        }
+    }
+
+    // Step 4: Signal that we committed to the pool. Check if we're the last
+    // workgroup.
+    AllMemoryBarrierWithGroupSync();
+
+    if (tid == 0) {
+        uint pre;
+        InterlockedAdd(bufferOutputScratch[0].committed, NUM_OUTPUT_THREADS, pre);
+        g_output.tmp1 = pre + NUM_OUTPUT_THREADS;
+    }
+
+    AllMemoryBarrierWithGroupSync();
+
+    if (g_output.tmp1 < specNVocab)
+        return; // not the last workgroup, exit
+#if DEBUG_OUTPUT
+    if (tid == 0)
+        printf("output: gid %u chosen\n", gid.x);
+#endif
+    // Step 5: Fetch the pool size and histogram.
+    uint globalPoolSize = bufferOutputScratch[0].poolSize;
+    g_output.histogram[0].bucket[tid] = bufferOutputScratch[0].histogram.bucket[tid];
+    g_output.histogram[1].bucket[tid] = 0;
+    g_output.tmp1 = 0;
+    g_output.tmp2 = 0;
+#if DEBUG_OUTPUT
+    if (tid == 0)
+        printf("globalPoolSize: %u\n", globalPoolSize);
+#endif
+    if (globalPoolSize > specNVocab) {
+        if (tid == 0)
+            printf("error: globalPoolSize: %u\n", globalPoolSize);
+        globalPoolSize = specNVocab;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Step 6: Fetch pool entries and do the first histogram for a radix sort of the top-K
+    processHistogram(0, waveId, /* topK */ true, /* accumulate */ true, /* debug */ false);
+
+    uint topKUpperBound = g_output.topKUpperBound;
+
+    uint numInbounds;
+    if ((topKUpperBound >> 24) == 255)
+        numInbounds = NUM_OUTPUT_THREADS;
+    else
+        numInbounds = g_output.histogram[0].bucket[histogramIndex((topKUpperBound >> 24) + 1)];
+
+    uint maxBoundary = NUM_OUTPUT_LOCAL_POOL - g_output.histogram[0].bucket[histogramIndex(topKUpperBound >> 24)];
+
+    assert(maxBoundary > 0);
+
+    if (tid == 0)
+        printf("numInbounds: %u maxBoundary: %u topKUpperBound: %8x\n", numInbounds, maxBoundary, topKUpperBound);
+
+    if (numInbounds > NUM_OUTPUT_LOCAL_POOL) {
+        // Refine the upper bound?
+        if (tid == 0)
+            printf("TODO: numInbounds too large: %u\n", numInbounds);
+    }
+
+    numInbounds = min(numInbounds, NUM_OUTPUT_LOCAL_POOL);
+
+    uint base = 0;
+    loadFromGlobalPool(tid, 1, base, globalPoolSize, topKUpperBound, numInbounds, maxBoundary);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Step 7: Sort from pool1 into pool2 according to first stage of radix sort
+    processHistogram(1, waveId, /* topK */ false, /* accumulate */ true, /* debug */ false);
+
+    for (uint srcIdx = tid; srcIdx < numInbounds; srcIdx += NUM_OUTPUT_THREADS) {
+        uint entry = g_output.pool1[srcIdx];
+        uint dstIdx;
+        InterlockedAdd(g_output.histogram[1].bucket[histogramIndex((entry >> 16) & 0xff)], 1, dstIdx);
+        // printf("radix1 tid: %u dstIdx: %u entry: %8x\n", tid, dstIdx, entry);
+        g_output.pool2[dstIdx] = entry;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    bufferOutputScratch[0].histogram.bucket[tid] = 0;
+
+    // Step 8: Sort from pool2 into pool1 according to the second stage of radix sort
+    //
+    // From this point on, we narrow further to a single wave.
+    //
+    // The copy needs to be stable, i.e. it needs to preserve the relative order
+    // of entries that go into the same bucket. Doing this with a single wave
+    // of at most 32 lanes is simpler.
+
+    if (waveId != 0)
+        return;
+
+    bufferOutputScratch[0].poolSize = 0;
+    bufferOutputScratch[0].committed = 0;
+
+    uint subWaveSize = min(waveSize, 32);
+    if (lane < subWaveSize) {
+        for (uint srcIdx = lane; srcIdx < numInbounds; srcIdx += subWaveSize) {
+            uint entry = g_output.pool2[srcIdx];
+
+            uint dummy;
+            g_output.histogram[1].bucket[entry >> 24] = 0;
+            InterlockedAdd(g_output.histogram[1].bucket[entry >> 24], 1u << lane, dummy);
+            uint mask = g_output.histogram[1].bucket[entry >> 24];
+            uint leader = firstbithigh(mask);
+            uint dstBase = 0;
+            if (lane == leader) {
+                InterlockedAdd(g_output.histogram[0].bucket[histogramIndex(entry >> 24)],
+                               countbits(mask), dstBase);
+            }
+            dstBase = WaveReadLaneAt(dstBase, leader);
+
+            // printf("radix2 tid: %2u entry: %8x dstBase: %3u mask: %8x leader: %u\n", tid, entry, dstBase,
+            //         mask, leader);
+
+            uint dstIdx = dstBase + countbits(mask & ((1u << lane) - 1));
+            g_output.pool1[dstIdx] = entry;
+        }
+    }
+
+    // Step 9: Compute softmax, topP, and sample
+    //
+
+    uint idx;
+    float scale = 1.0 / g_constants.temp;
+    float maxLogit = -1.#INF;
+
+    for (idx = lane; idx < g_constants.topK; idx += waveSize) {
+        uint token;
+        float weight;
+        decodeOutput(g_output.pool1[idx], token, weight);
+
+        // TODO: Repetition penalty?
+        float logit = weight * scale;
+        g_output.pool2[idx] = asuint(logit);
+        maxLogit = max(maxLogit, logit);
+    }
+
+    maxLogit = WaveActiveMax(maxLogit);
+
+    float sum = 0;
+    for (idx = lane; idx < g_constants.topK; idx += waveSize) {
+        float logit = asfloat(g_output.pool2[idx]) - maxLogit;
+        float p = exp(logit);
+        g_output.pool2[idx] = asuint(p);
+        sum += p;
+    }
+    sum = WaveActiveSum(sum);
+    float recip_sum = 1.0 / sum;
+
+    float accum = 0;
+    float topPEnd = 1.0;
+    for (idx = lane; idx < g_constants.topK; idx += waveSize) {
+        float p = asfloat(g_output.pool2[idx]) * recip_sum;
+        float cump = accum + WavePrefixSum(p);
+        accum += WaveActiveSum(p);
+
+        bool inTopP = cump < g_constants.topP;
+        uint numInTopP = WaveActiveCountBits(inTopP);
+        topPEnd = numInTopP > 0 ? WaveReadLaneAt(cump + p, numInTopP - 1) : topPEnd;
+
+#if DEBUG_OUTPUT
+        {
+            uint token;
+            float dummy;
+            decodeOutput(g_output.pool1[idx], token, dummy);
+            printf("%3u: token: %5u p: %8f cump: %8f\n", idx, token, p, cump);
+        }
+#endif
+
+        g_output.pool2[idx] = asuint(cump);
+    }
+
+    float rand = g_constants.rand * topPEnd;
+    uint numSkip = 0;
+    for (idx = lane; idx < g_constants.topK; idx += waveSize) {
+        float cump = asfloat(g_output.pool2[idx]);
+        bool skip = cump < rand;
+        uint numLocalSkip = WaveActiveCountBits(skip);
+
+        numSkip += numLocalSkip;
+        if (numLocalSkip < waveSize)
+            break;
+    }
+
+    uint token;
+    float weight;
+    decodeOutput(g_output.pool1[numSkip], token, weight);
+
+#if DEBUG_OUTPUT
+    if (lane == 0)
+        printf("chosen token: %u (numSkip: %u, const.rand: %8f rand: %8f)\n",
+               token, numSkip, g_constants.rand, rand);
+#endif
+
+    bufferResult[0].token = token;
 }

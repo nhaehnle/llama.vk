@@ -7,6 +7,7 @@ using uint = uint32_t;
 #endif
 
 #define NUM_THIN_MATMUL_THREADS 128
+#define NUM_OUTPUT_THREADS 256
 
 struct GlobalConstantBuffer {
     float rmsEpsilon;
@@ -16,12 +17,26 @@ struct GlobalConstantBuffer {
     uint currentHistoryBase;
     uint currentHistoryLength;
     uint numKeyValueEntries;
+    uint topK;
+    float topP;
+    float temp;
+    float rand;
 };
 
-struct HostBuffer {
-    // TODO
-    uint result_token;
-    uint result_topK[1];
+struct ResultBuffer {
+    uint token;
+};
+
+struct Histogram {
+    uint bucket[256];
+};
+
+struct OutputScratch {
+    Histogram histogram;
+    uint poolSize;
+    uint padding1[63];
+    uint committed;
+    uint padding2[63];
 };
 
 #ifdef LLAMA_HOST

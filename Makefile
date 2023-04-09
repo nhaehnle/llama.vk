@@ -254,6 +254,7 @@ KERNELS := \
 	KernelThinFp16Attention \
 	KernelThinFp16Ffn \
 	KernelThinFp16FirstRmsNorm \
+	KernelThinFp16Output \
 	KernelThinFp16MatMulAdd \
 	KernelThinFp16RmsNorm
 
