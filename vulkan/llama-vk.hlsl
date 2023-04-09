@@ -1215,8 +1215,10 @@ void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThrea
 
     assert(maxBoundary > 0);
 
+#if DEBUG_OUTPUT
     if (tid == 0)
         printf("numInbounds: %u maxBoundary: %u topKUpperBound: %8x\n", numInbounds, maxBoundary, topKUpperBound);
+#endif
 
     if (numInbounds > NUM_OUTPUT_LOCAL_POOL) {
         // Refine the upper bound?
@@ -1317,8 +1319,14 @@ void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThrea
 
     float accum = 0;
     float topPEnd = 1.0;
-    for (idx = lane; idx < g_constants.topK; idx += waveSize) {
-        float p = asfloat(g_output.pool2[idx]) * recip_sum;
+    uint row;
+    for (row = 0; row * waveSize < g_constants.topK; ++row) {
+        idx = row * waveSize + lane;
+
+        float p = 0;
+        if (idx < g_constants.topK)
+            p = asfloat(g_output.pool2[idx]) * recip_sum;
+
         float cump = accum + WavePrefixSum(p);
         accum += WaveActiveSum(p);
 
@@ -1327,22 +1335,24 @@ void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThrea
         topPEnd = numInTopP > 0 ? WaveReadLaneAt(cump + p, numInTopP - 1) : topPEnd;
 
 #if DEBUG_OUTPUT
-        {
+        if (idx < g_constants.topK) {
             uint token;
             float dummy;
             decodeOutput(g_output.pool1[idx], token, dummy);
-            printf("%3u: token: %5u p: %8f cump: %8f\n", idx, token, p, cump);
+            printf("%3u: token: %5u p: %8f cump + p: %8f\n", idx, token, p, cump + p);
         }
 #endif
 
-        g_output.pool2[idx] = asuint(cump);
+        g_output.pool2[idx] = asuint(cump + p);
     }
 
     float rand = g_constants.rand * topPEnd;
     uint numSkip = 0;
-    for (idx = lane; idx < g_constants.topK; idx += waveSize) {
+    for (row = 0; row * waveSize < g_constants.topK; ++row) {
+        idx = row * waveSize + lane;
+
         float cump = asfloat(g_output.pool2[idx]);
-        bool skip = cump < rand;
+        bool skip = cump < rand && idx + 1 < g_constants.topK;
         uint numLocalSkip = WaveActiveCountBits(skip);
 
         numSkip += numLocalSkip;
@@ -1350,14 +1360,16 @@ void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThrea
             break;
     }
 
+    uint chosen = g_output.pool1[numSkip];
     uint token;
     float weight;
-    decodeOutput(g_output.pool1[numSkip], token, weight);
+    decodeOutput(chosen, token, weight);
 
 #if DEBUG_OUTPUT
-    if (lane == 0)
-        printf("chosen token: %u (numSkip: %u, const.rand: %8f rand: %8f)\n",
-               token, numSkip, g_constants.rand, rand);
+    if (lane == 0) {
+        printf("chosen token: %u (numSkip: %u, const.rand: %8f rand: %8f %8x)\n",
+               token, numSkip, g_constants.rand, rand, chosen);
+    }
 #endif
 
     bufferResult[0].token = token;

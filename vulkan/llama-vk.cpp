@@ -8,6 +8,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -972,6 +973,8 @@ private:
     Instance &vk;
     Device &device;
 
+    std::mt19937 m_rng;
+
     unsigned m_numVocab;
     unsigned m_numLayers;
     unsigned m_maxCacheEntries;
@@ -1066,6 +1069,12 @@ private:
     CommandBuffer m_commandBuffers[2];
 
     std::unique_ptr<ModelUploader> m_uploader;
+
+    struct {
+        unsigned rotaryPosition = 0;
+        unsigned historyBase = 0;
+        unsigned historyLength = 0;
+    } m_stream;
 };
 
 LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
@@ -2297,21 +2306,25 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
 llama_token LlamaContext::process(const llama_token *tokens, size_t numTokens) {
     shader::GlobalConstantBuffer constants = {};
     constants.rmsEpsilon = 1e-6f;
-    constants.currentHistoryBase = 0;
     constants.numKeyValueEntries = m_maxCacheEntries;
     constants.topK = 40;
     constants.topP = 0.95;
     constants.temp = 0.8;
-    constants.rand = 0.0; // TODO
+
+    std::uniform_real_distribution<> unit(0.0, 1.0);
+    constants.rand = unit(m_rng);
 
     unsigned historyGroup = constants.currentHistoryBase / m_specData.nCtx;
 
     llama_token token = 0;
     for (size_t idx = 0; idx < numTokens; ++idx) {
         constants.currentToken = tokens[idx];
-        constants.currentRotaryPosition = idx;
-        constants.currentHistoryLength = idx;
-        constants.currentStorageIndex = idx;
+        constants.currentRotaryPosition = m_stream.rotaryPosition;
+        constants.currentHistoryBase = m_stream.historyBase;
+        constants.currentHistoryLength = m_stream.historyLength;
+        constants.currentStorageIndex = (m_stream.historyBase + m_stream.historyLength) % m_specData.nCtx;
+
+        assert(constants.currentStorageIndex < m_maxCacheEntries);
 
         WriteHistoryIndex writeHistory;
         uint relativeIdx = (constants.currentHistoryBase + constants.currentHistoryLength) % m_specData.nCtx;
@@ -2320,6 +2333,9 @@ llama_token LlamaContext::process(const llama_token *tokens, size_t numTokens) {
 
         bool debug = false;
         submitPass(constants, writeHistory, debug, idx == numTokens - 1 ? &token : nullptr);
+
+        ++m_stream.rotaryPosition;
+        ++m_stream.historyLength;
     }
 
     return token;
@@ -2547,8 +2563,21 @@ int main(int argc, char **argv) {
         printf("  %u: '%s'\n", token, llama_token_to_str(ctx, token));
     printf("--\n");
 
-    llama_token next = vkctx.process(embd_inp.data(), embd_inp.size());
-    printf("  %u: '%s'\n", next, llama_token_to_str(ctx, next));
+    for (unsigned count = 0; count < params.n_predict; ++count) {
+        llama_token next = vkctx.process(embd_inp.data(), embd_inp.size());
+#if 1
+        printf("%s", llama_token_to_str(ctx, next));
+#else
+        printf(" %5u: '%s'\n", next, llama_token_to_str(ctx, next));
+#endif
+        fflush(stdout);
+
+        if (next == llama_token_eos())
+            break;
+
+        embd_inp.clear();
+        embd_inp.push_back(next);
+    }
 
     return 0;
 }
