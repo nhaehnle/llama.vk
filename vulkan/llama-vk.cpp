@@ -945,7 +945,7 @@ class LlamaContext {
     struct ModelUploader;
 public:
     LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
-                 unsigned maxCacheEntries);
+                 int seed, unsigned maxCacheEntries);
     ~LlamaContext();
 
     void uploadModel();
@@ -1078,9 +1078,14 @@ private:
 };
 
 LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
-                           unsigned maxCacheEntries)
+                           int seed, unsigned maxCacheEntries)
     : vk(vk), device(device), m_modelPath(modelPath), m_fileInfo(fileInfo)
 {
+    if (seed <= 0)
+        seed = time(NULL);
+
+    m_rng = std::mt19937(seed);
+
     m_numVocab = fileInfo.n_vocab;
     m_numLayers = fileInfo.n_layer;
     m_maxCacheEntries = maxCacheEntries;
@@ -2548,7 +2553,7 @@ int main(int argc, char **argv) {
     if (!ctx)
         exit(1);
 
-    llvk::LlamaContext vkctx(vk, device, params.model, model_file_info, 2048);
+    llvk::LlamaContext vkctx(vk, device, params.model, model_file_info, params.seed, 2048);
 
     vkctx.uploadModel();
 

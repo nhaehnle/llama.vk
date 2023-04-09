@@ -78,11 +78,13 @@ void rmsNormTopHalf(uint tid, uint numPerLane, half2 activations[16]) {
     uint idx;
     [[unroll]] for (idx = 0; idx + 3 <= numPerLane / 2; idx += 3) {
         [[unroll]] for (uint i = 0; i < 3; ++i) {
-            means[i] += dot(activations[idx + i], activations[idx + i]);
+            float2 x = activations[idx + i];
+            means[i] += dot(x, x);
         }
     }
     [[unroll]] for (uint i = 0; idx + i < numPerLane / 2; ++i) {
-        means[i] += dot(activations[idx + i], activations[idx + i]);
+        float2 x = activations[idx + i];
+        means[i] += dot(x, x);
     }
 
     // Reduce across threads
@@ -150,7 +152,7 @@ void storeNormActivations(uint tid, uint numThreads, uint numPerLane, half2 acti
     }
 
     if (swizzled)
-        offset = 2 * idx * numThreads + 4 * tid;
+        offset = 4 * idx * numThreads + 4 * tid;
     [[unroll]] for (; idx < numPerLane / 2; ++idx) {
         if (specMode == 0) {
             activations[idx] *= bufferAttentionNorm.Load<half2>(offset);
@@ -185,7 +187,7 @@ void storeNormActivations(uint tid, uint numThreads, uint numPerLane, half2 acti
     }
 
     if (swizzled)
-        offset = 2 * idx * numThreads + 4 * tid;
+        offset = 4 * idx * numThreads + 4 * tid;
     [[unroll]] for (; idx < numPerLane / 2; ++idx) {
         bufferStage1.Store(offset, activations[idx]);
         if (swizzled)
@@ -318,7 +320,7 @@ void KernelThinFp16RmsNorm(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThre
         offset += NUM_WGP_THREADS * 16;
     }
 
-    offset = 2 * idx * NUM_WGP_THREADS + 4 * localTid.x;
+    offset = 4 * idx * NUM_WGP_THREADS + 4 * localTid.x;
     [[unroll]] for (; idx < rmsNEmbdPerLane / 2; ++idx) {
         activations[idx] = bufferBypass.Load<half2>(offset);
         offset += NUM_WGP_THREADS * 4;
