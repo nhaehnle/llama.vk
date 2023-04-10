@@ -119,7 +119,7 @@ int main(int argc, char ** argv) {
         lparams.use_mlock  = params.use_mlock;
         lparams.embedding  = params.embedding;
 
-        ctx = llama_init_from_file(params.model.c_str(), lparams, nullptr);
+        ctx = llama_init_from_file(params.model.c_str(), lparams);
 
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());

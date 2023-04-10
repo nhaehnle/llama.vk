@@ -3,9 +3,26 @@
 #ifndef LLAMA_INTERNAL_H
 #define LLAMA_INTERNAL_H
 
+#include "ggml.h"
+
 #include <vector>
 #include <string>
-struct ggml_tensor;
+#include <unordered_map>
+
+struct llama_vocab {
+    using id    = int32_t;
+    using token = std::string;
+
+    struct token_score {
+        token tok;
+        float score;
+    };
+
+    std::unordered_map<token, id> token_to_id;
+    std::vector<token_score> id_to_token;
+};
+
+std::vector<llama_vocab::id> llama_tokenize(const llama_vocab & vocab, const std::string & text, bool bos);
 
 struct llama_load_tensor_shard {
     std::vector<uint32_t> ne;
@@ -53,6 +70,22 @@ enum llama_file_version {
     LLAMA_FILE_VERSION_GGML,
     LLAMA_FILE_VERSION_GGMF_V1, // added version field and scores in vocab
     LLAMA_FILE_VERSION_GGJT_V1, // added padding
+};
+
+// default hparams (LLaMA 7B)
+struct llama_hparams {
+    uint32_t n_vocab = 32000;
+    uint32_t n_ctx   = 512;   // this is provided as user input?
+    uint32_t n_embd  = 4096;
+    uint32_t n_mult  = 256;
+    uint32_t n_head  = 32;
+    uint32_t n_layer = 32;
+    uint32_t n_rot   = 64;
+    uint32_t f16     = 1;
+
+    bool operator!=(const llama_hparams & other) const {
+        return memcmp(this, &other, sizeof(llama_hparams));
+    }
 };
 
 struct llama_file_loader {

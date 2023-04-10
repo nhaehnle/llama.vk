@@ -100,7 +100,7 @@ int main(int argc, char ** argv) {
         lparams.use_mmap   = params.use_mmap;
         lparams.use_mlock  = params.use_mlock;
 
-        ctx = llama_init_from_file(params.model.c_str(), lparams, nullptr);
+        ctx = llama_init_from_file(params.model.c_str(), lparams);
 
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
@@ -163,7 +163,7 @@ int main(int argc, char ** argv) {
     }
 
     // enable interactive mode if reverse prompt or interactive start is specified
-    if (params.antiprompt.size() != 0 || params.interactive_start) { 
+    if (params.antiprompt.size() != 0 || params.interactive_start) {
         params.interactive = true;
     }
 

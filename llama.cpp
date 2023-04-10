@@ -2,8 +2,6 @@
 #include "llama.h"
 #include "llama_internal.h"
 
-#include "ggml.h"
-
 #include <array>
 #include <cinttypes>
 #include <fstream>
@@ -66,22 +64,6 @@ static const std::map<e_model, size_t> MEM_REQ_EVAL = {
     { MODEL_13B, 1024ull*MB },
     { MODEL_30B, 1280ull*MB },
     { MODEL_65B, 1536ull*MB },
-};
-
-// default hparams (LLaMA 7B)
-struct llama_hparams {
-    uint32_t n_vocab = 32000;
-    uint32_t n_ctx   = 512;   // this is provided as user input?
-    uint32_t n_embd  = 4096;
-    uint32_t n_mult  = 256;
-    uint32_t n_head  = 32;
-    uint32_t n_layer = 32;
-    uint32_t n_rot   = 64;
-    uint32_t f16     = 1;
-
-    bool operator!=(const llama_hparams & other) const {
-        return memcmp(this, &other, sizeof(llama_hparams));
-    }
 };
 
 struct llama_layer {
@@ -157,19 +139,6 @@ struct llama_model {
             ggml_free(ctx);
         }
     }
-};
-
-struct llama_vocab {
-    using id    = int32_t;
-    using token = std::string;
-
-    struct token_score {
-        token tok;
-        float score;
-    };
-
-    std::unordered_map<token, id> token_to_id;
-    std::vector<token_score> id_to_token;
 };
 
 struct llama_context {
@@ -1364,7 +1333,7 @@ private:
     llama_sp_bigram::queue work_queue_;
 };
 
-static std::vector<llama_vocab::id> llama_tokenize(const llama_vocab & vocab, const std::string & text, bool bos) {
+std::vector<llama_vocab::id> llama_tokenize(const llama_vocab & vocab, const std::string & text, bool bos) {
     llama_tokenizer tokenizer(vocab);
     std::vector<llama_vocab::id> output;
 

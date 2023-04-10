@@ -13,7 +13,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../ggml.h"
 #include "../llama.h"
+#include "../llama_util.h"
+#include "../llama_internal.h"
 
 #include "vulkan/vulkan.h"
 
@@ -129,7 +132,6 @@ Instance::Instance(VkInstance instance) : theInstance(instance) {
 }
 
 OwnedInstance OwnedInstance::createDefault() {
-    PFN_vkEnumerateInstanceLayerProperties EnumerateInstanceLayerProperties = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceLayerProperties"));
     PFN_vkCreateInstance CreateInstance = reinterpret_cast<PFN_vkCreateInstance>(vkGetInstanceProcAddr(NULL, "vkCreateInstance"));
 
     VkApplicationInfo applicationInfo = {};
@@ -231,8 +233,8 @@ public:
            VkQueue computeQueue, uint32_t computeQueueFamily,
            VkQueue transferQueue, uint32_t transferQueueFamily)
         : vk(&vk), device(device)
-        , m_computeQueue(computeQueue), m_computeQueueFamily(computeQueueFamily)
-        , m_transferQueue(transferQueue), m_transferQueueFamily(transferQueueFamily)
+        , m_computeQueue(computeQueue), m_transferQueue(transferQueue)
+        , m_computeQueueFamily(computeQueueFamily), m_transferQueueFamily(transferQueueFamily)
     {
         assert(computeQueue != nullptr);
     }
@@ -872,7 +874,7 @@ OwnedDevice OwnedDevice::createDefault(Instance &vk) {
 
     ownedDevice.init(physicalDevice);
 
-    return std::move(ownedDevice);
+    return ownedDevice;
 }
 
 // Tensor types on the GPU
@@ -944,11 +946,16 @@ static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
 class LlamaContext {
     struct ModelUploader;
 public:
-    LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
+    LlamaContext(Instance &vk, Device &device, const std::string &modelPath,
                  int seed, unsigned maxCacheEntries);
     ~LlamaContext();
 
     void uploadModel();
+
+    const llama_vocab &vocab() const { return m_loader->loader.vocab; }
+    const char *tokenToStr(llama_vocab::id id) const {
+        return m_loader->loader.vocab.id_to_token[id].tok.c_str();
+    }
 
     llama_token process(const llama_token *token, size_t numTokens);
 
@@ -975,7 +982,6 @@ private:
 
     std::mt19937 m_rng;
 
-    unsigned m_numVocab;
     unsigned m_numLayers;
     unsigned m_maxCacheEntries;
 
@@ -1038,8 +1044,20 @@ private:
     } m_hostOffsets;
     MemoryAndBuffer m_hostMemory;
 
+    struct Loader {
+        llama_load_tensors_map tensors;
+        llama_file_loader loader;
+
+        Loader(const std::string &modelPath)
+            : loader(modelPath.c_str(), 0, tensors) {
+            for (llama_load_tensor & lt : tensors.tensors) {
+                lt.calc_all();
+            }
+        }
+    };
+
     std::string m_modelPath;
-    llama_file_info m_fileInfo;
+    std::unique_ptr<Loader> m_loader;
 
     SpecConstants m_specData;
     VkSpecializationInfo m_specInfo;
@@ -1077,22 +1095,36 @@ private:
     } m_stream;
 };
 
-LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath, const llama_file_info &fileInfo,
+LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &modelPath,
                            int seed, unsigned maxCacheEntries)
-    : vk(vk), device(device), m_modelPath(modelPath), m_fileInfo(fileInfo)
+    : vk(vk), device(device), m_modelPath(modelPath)
 {
     if (seed <= 0)
         seed = time(NULL);
 
     m_rng = std::mt19937(seed);
 
-    m_numVocab = fileInfo.n_vocab;
-    m_numLayers = fileInfo.n_layer;
-    m_maxCacheEntries = maxCacheEntries;
-    m_specData.nEmbd = fileInfo.n_embd;
-    m_specData.nFF = fileInfo.n_ff;
-    m_specData.nHead = fileInfo.n_head;
-    m_specData.nVocab = fileInfo.n_vocab;
+    try {
+        m_loader = std::make_unique<Loader>(modelPath);
+
+        if (m_loader->loader.file_version != LLAMA_FILE_VERSION_GGJT_V1)
+            throw format("unsupported file version");
+
+        const auto &hparams = m_loader->loader.hparams;
+        if (hparams.n_rot != 128)
+            throw format("unsupported n_rot = %u", hparams.n_rot);
+
+        m_maxCacheEntries = maxCacheEntries;
+        m_numLayers = hparams.n_layer;
+        m_specData.nEmbd = hparams.n_embd;
+        m_specData.nFF = ((2*(4*hparams.n_embd)/3 + hparams.n_mult - 1)/hparams.n_mult)*hparams.n_mult;
+        m_specData.nHead = hparams.n_head;
+        m_specData.nVocab = hparams.n_vocab;
+        m_specData.nCtx = hparams.n_ctx;
+    } catch (const std::string & err) {
+        fprintf(stderr, "error loading model: %s\n", err.c_str());
+        exit(1);
+    }
 
     // Step 1: Descriptor set and pipeline layouts and pipelines
     m_specInfo.mapEntryCount = sizeof(g_specMapEntries) / sizeof(g_specMapEntries[0]);
@@ -1162,9 +1194,9 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
 
         OFFSET(m_globalOffsets, constants[0], sizeof(shader::GlobalConstantBuffer));
         OFFSET(m_globalOffsets, constants[1], sizeof(shader::GlobalConstantBuffer));
-        OFFSET(m_globalOffsets, historyIndex, 4 * 2048);
+        OFFSET(m_globalOffsets, historyIndex, 4 * m_specData.nCtx);
 
-        uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_numVocab);
+        uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_specData.nVocab);
         OFFSET(m_globalOffsets, embedding, embdMatrixSize);
         OFFSET(m_globalOffsets, modelNorm, 2 * m_specData.nEmbd);
         OFFSET(m_globalOffsets, modelOutput, embdMatrixSize);
@@ -1386,43 +1418,6 @@ VkPipeline LlamaContext::createPipeline(const std::string &kernelName) {
     return pipeline;
 }
 
-// Tensor types in GGML files
-enum {
-    FTYPE_F32 = 0,
-    FTYPE_F16 = 1,
-    FTYPE_Q4_0 = 2,
-    FTYPE_Q4_1 = 3,
-};
-
-uint64_t ftypeSize(int32_t ftype, uint64_t ne0, uint64_t ne1) {
-    switch (ftype) {
-    case FTYPE_F32:
-        return 4 * ne0 * ne1;
-    case FTYPE_F16:
-        return 2 * ne0 * ne1;
-    case FTYPE_Q4_0:
-        assert((ne0 % 32) == 0);
-        return (4 + 16) * (ne0 / 32) * ne1;
-    case FTYPE_Q4_1:
-        assert((ne0 % 32) == 0);
-        return (2 * 4 + 16) * (ne0 / 32) * ne1;
-    }
-    abort();
-}
-
-enum {
-    SPLIT_PARTS_COLUMN = 0,
-    SPLIT_PARTS_ROW = 1,
-};
-
-struct TensorOffsets {
-    int32_t ftype;
-    int32_t splitType;
-    int32_t numDims;
-    int32_t numElementsPerPart[2];
-    std::vector<size_t> offsets;
-};
-
 struct TensorUpload {
     std::string name;
     int32_t vktype;
@@ -1438,9 +1433,6 @@ struct TensorUpload {
 
 struct LlamaContext::ModelUploader {
     LlamaContext &ctx;
-    std::unordered_map<std::string, TensorOffsets> m_tensors;
-    std::vector<std::ifstream> m_parts;
-    std::vector<char> m_fileBuffer;
     TimelineSemaphore m_semaphore;
     uint64_t m_numSubmits = 0;
     size_t m_maxUploadSize = 0;
@@ -1455,7 +1447,6 @@ struct LlamaContext::ModelUploader {
     void lazyInit();
     void finish();
 
-    void openAndScan();
     void upload(const TensorUpload *uploads, size_t numUploads);
     template <size_t N>
     void upload(const TensorUpload (&uploads)[N]) {
@@ -1477,149 +1468,7 @@ void LlamaContext::ModelUploader::finish() {
     m_commandPool = nullptr;
 
     m_uploadBuffer.reset();
-
-    m_parts.clear();
-    m_tensors.clear();
-    m_fileBuffer.clear();
     m_numSubmits = 0;
-}
-
-// Open the model file(s) and scan them to find the tensor offsets.
-void LlamaContext::ModelUploader::openAndScan() {
-    size_t perFileBufferSize = 1024 * 1024;
-    m_fileBuffer.resize(ctx.m_fileInfo.n_parts * perFileBufferSize);
-
-    for (int i = 0; i < ctx.m_fileInfo.n_parts; ++i) {
-        std::string fname = ctx.m_modelPath;
-        if (i > 0) {
-            fname += "." + std::to_string(i);
-        }
-
-        m_parts.emplace_back(fname, std::ios::binary);
-        std::ifstream &fin = m_parts.back();
-        fin.rdbuf()->pubsetbuf(m_fileBuffer.data() + i * perFileBufferSize, perFileBufferSize);
-
-        fin.seekg(0, std::ios::end);
-        const size_t fileSize = fin.tellg();
-
-        fin.seekg(ctx.m_fileInfo.tensors_offset);
-
-#define CHECK(cond) \
-        do { \
-            if (!(cond)) { \
-                fprintf(stderr, "%s: broken model file %s: %s\n", __func__, fname.c_str(), #cond); \
-                exit(1); \
-            } \
-        } while (false)
-
-        for (;;) {
-            int32_t n_dims;
-            int32_t length;
-            int32_t ftype;
-
-            fin.read(reinterpret_cast<char *>(&n_dims), sizeof(n_dims));
-            fin.read(reinterpret_cast<char *>(&length), sizeof(length));
-            fin.read(reinterpret_cast<char *>(&ftype),  sizeof(ftype));
-
-            CHECK(n_dims <= 2);
-
-            int32_t nelements = 1;
-            int32_t ne[2] = { 1, 1 };
-            for (int i = 0; i < n_dims; ++i) {
-                fin.read(reinterpret_cast<char *>(&ne[i]), sizeof(ne[i]));
-                CHECK(ne[i] <= std::numeric_limits<int32_t>::max() / nelements);
-                nelements *= ne[i];
-            }
-
-            std::string name(length, 0);
-            fin.read(&name[0], length);
-
-            size_t offset = fin.tellg();
-
-            TensorOffsets &tensor = m_tensors[name];
-            if (tensor.offsets.empty()) {
-                tensor.ftype = ftype;
-                tensor.numDims = n_dims;
-                tensor.numElementsPerPart[0] = ne[0];
-                tensor.numElementsPerPart[1] = ne[1];
-
-                // split_type = columns:
-                // pattern:
-                //   - tok_embeddings.*
-                //   - layers.*.attention.wo.weight
-                //   - layers.*.feed_forward.w2.weight
-
-                // split_type = rows:
-                // pattern:
-                //   - output.*
-                //   - layers.*.attention.wq.weight
-                //   - layers.*.attention.wk.weight
-                //   - layers.*.attention.wv.weight
-                //   - layers.*.feed_forward.w1.weight
-                //   - layers.*.feed_forward.w3.weight
-                if (name.find("tok_embeddings") != std::string::npos) {
-                    tensor.splitType = SPLIT_PARTS_COLUMN;
-                } else if (name.find("layers") != std::string::npos) {
-                    if (name.find("attention.wo.weight") != std::string::npos) {
-                        tensor.splitType = SPLIT_PARTS_COLUMN;
-                    } else if (name.find("feed_forward.w2.weight") != std::string::npos) {
-                        tensor.splitType = SPLIT_PARTS_COLUMN;
-                    } else {
-                        tensor.splitType = SPLIT_PARTS_ROW;
-                    }
-                } else if (name.find("output") != std::string::npos) {
-                    tensor.splitType = SPLIT_PARTS_ROW;
-                }
-            } else {
-                CHECK(ftype == tensor.ftype);
-                CHECK(tensor.numDims == n_dims);
-                CHECK(tensor.numElementsPerPart[0] == ne[0]);
-                CHECK(tensor.numElementsPerPart[1] == ne[1]);
-            }
-
-            tensor.offsets.resize(ctx.m_fileInfo.n_parts);
-            CHECK(!tensor.offsets[i]);
-            tensor.offsets[i] = offset;
-
-            size_t tensorSize;
-            switch (ftype) {
-            case FTYPE_F32: tensorSize = 4 * size_t(nelements); break;
-            case FTYPE_F16: tensorSize = 2 * size_t(nelements); break;
-            case FTYPE_Q4_0:
-                CHECK(ne[0] % 64 == 0); // File format block size is 32, but the GPU swizzle wants 64
-                tensorSize = (4 + 16) * size_t(nelements / 32);
-                break;
-            case FTYPE_Q4_1:
-                CHECK(ne[0] % 64 == 0); // File format block size is 32, but the GPU swizzle wants 64
-                tensorSize = (2 * 4 + 16) * size_t(nelements / 32);
-                break;
-            default:
-                CHECK(!"bad ftype");
-                break;
-            }
-
-            CHECK(offset + tensorSize <= fileSize);
-            fin.seekg(tensorSize, std::ios::cur);
-            if (!fin) {
-                fprintf(stderr, "%s: seek past tensor failed\n", __func__);
-                exit(1);
-            }
-
-            if (offset + tensorSize >= fileSize)
-                break;
-        }
-
-#undef CHECK
-    }
-
-    for (const auto &entry : m_tensors) {
-        for (auto offset : entry.second.offsets) {
-            if (!offset) {
-                fprintf(stderr, "%s: missing part of tensor '%s'\n", __func__, entry.first.c_str());
-                exit(1);
-            }
-        }
-    }
 }
 
 void LlamaContext::ModelUploader::lazyInit() {
@@ -1765,23 +1614,26 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
                 continue;
             }
 
-            auto tensorIt = m_tensors.find(upload.name);
-            if (tensorIt == m_tensors.end()) {
+            auto &tensors = ctx.m_loader->tensors;
+            auto tensorIt = tensors.name_to_idx.find(upload.name);
+            if (tensorIt == tensors.name_to_idx.end()) {
                 fprintf(stderr, "%s: missing tensor '%s'\n", __func__, upload.name.c_str());
                 exit(1);
             }
-            const TensorOffsets &tensor = tensorIt->second;
+            const llama_load_tensor &tensor = tensors.tensors[tensorIt->second];
+            assert(tensor.split_type == SPLIT_NONE);
+            assert(tensor.ne.size() == 1 || tensor.ne.size() == 2);
 
             // Per-tensor sanity checks
             const char *typeCheckFail = nullptr;
             switch (upload.vktype) {
             case VKTYPE_F16:
-                if (tensor.ftype != FTYPE_F32 && tensor.ftype != FTYPE_F16)
+                if (tensor.type != GGML_TYPE_F32 && tensor.type != GGML_TYPE_F16)
                     typeCheckFail = "f16";
                 break;
             case VKTYPE_Q4_0_SWZ:
             case VKTYPE_Q4_0_LINEAR:
-                if (tensor.ftype != FTYPE_Q4_0)
+                if (tensor.type != GGML_TYPE_Q4_0)
                     typeCheckFail = "q4_0";
                 break;
             default:
@@ -1790,134 +1642,108 @@ void LlamaContext::ModelUploader::upload(const TensorUpload *uploads, size_t num
             }
             if (typeCheckFail) {
                 fprintf(stderr, "%s: upload '%s' as %s, but ftype is %u\n",
-                        __func__, upload.name.c_str(), typeCheckFail, tensor.ftype);
+                        __func__, upload.name.c_str(), typeCheckFail, tensor.type);
                 exit(1);
             }
 
-            int32_t fullTensorElements[2] = { tensor.numElementsPerPart[0], tensor.numElementsPerPart[1] };
+            int32_t ne[2];
+            ne[0] = tensor.ne[0];
+            if (tensor.ne.size() >= 2)
+                ne[1] = tensor.ne[1];
+            else
+                ne[1] = 1;
 
-            if (tensor.numDims == 2) {
-                if (tensor.splitType == SPLIT_PARTS_COLUMN) {
-                    fullTensorElements[0] *= m_parts.size();
-                } else {
-                    fullTensorElements[1] *= m_parts.size();
-                }
-            }
-
-            if (fullTensorElements[0] != upload.numElements[0] ||
-                fullTensorElements[1] != upload.numElements[1])
+            if (ne[0] != upload.numElements[0] ||
+                ne[1] != upload.numElements[1])
             {
-                fprintf(stderr, "%s: tensor '%s' has size %dx%x (per part: %dx%d), expect %dx%d\n",
+                fprintf(stderr, "%s: tensor '%s' has size %dx%x, expect %dx%d\n",
                         __func__, upload.name.c_str(),
-                        fullTensorElements[0], fullTensorElements[1],
-                        tensor.numElementsPerPart[0], tensor.numElementsPerPart[1],
+                        ne[0], ne[1],
                         upload.numElements[0], upload.numElements[1]);
                 exit(1);
             }
 
             // Load from file and copy/swizzle to upload buffer.
-            size_t tensorParts = tensor.numDims == 2 ? m_parts.size() : 1;
-            size_t srcRowBytes = ftypeSize(tensor.ftype, tensor.numElementsPerPart[0], 1);
+            size_t srcRowBytes = ne[0] * ggml_type_size(tensor.type) / ggml_blck_size(tensor.type);
+            assert(vktypeSize(upload.vktype, ne[0], ne[1]) <= upload.range.range);
 
-            assert(vktypeSize(upload.vktype, fullTensorElements[0], fullTensorElements[1]) <= upload.range.range);
-
-            if ((upload.vktype == VKTYPE_F16 && tensor.ftype == FTYPE_F32) ||
+            if ((upload.vktype == VKTYPE_F16 && tensor.type == GGML_TYPE_F32) ||
                 upload.vktype == VKTYPE_Q4_0_SWZ || upload.vktype == VKTYPE_Q4_0_LINEAR) {
                 convertBuffer.resize(srcRowBytes);
             }
 
             char * __restrict__ cbuf = convertBuffer.data();
+            auto &fin = ctx.m_loader->loader.file;
+            fin.seek(tensor.shards[0].file_off, SEEK_SET);
 
-            for (unsigned part = 0; part < tensorParts; ++part) {
-                auto &fin = m_parts[part];
-                fin.seekg(tensor.offsets[part], std::ios::beg);
+            if (upload.vktype == VKTYPE_Q4_0_SWZ || upload.vktype == VKTYPE_Q4_0_LINEAR) {
+                assert(ne[0] % 64 == 0);
+                size_t nDoubleBlocks = size_t(ne[0] / 64);
+                size_t dstScaleBytes = 4 * nDoubleBlocks * ne[1];
+                char * __restrict__ tensorUploadScales = (char *)buffer + uploadOffset;
+                char * __restrict__ tensorUploadWeights = (char *)buffer + uploadOffset + dstScaleBytes;
+                size_t scaleRowStride;
+                size_t weightsRowStride;
+                size_t scaleBlockStride;
+                size_t weightsBlockStride;
 
-                if (upload.vktype == VKTYPE_Q4_0_SWZ || upload.vktype == VKTYPE_Q4_0_LINEAR) {
-                    assert(tensor.numElementsPerPart[0] % 64 == 0);
-                    size_t nDoubleBlocks = size_t(fullTensorElements[0] / 64);
-                    size_t dstScaleBytes = 4 * nDoubleBlocks * fullTensorElements[1];
-                    size_t dstWeightsBytes = 32 * nDoubleBlocks * fullTensorElements[1];
-                    char * __restrict__ tensorUploadScales = (char *)buffer + uploadOffset;
-                    char * __restrict__ tensorUploadWeights = (char *)buffer + uploadOffset + dstScaleBytes;
-                    size_t scaleRowStride;
-                    size_t weightsRowStride;
-                    size_t scaleBlockStride;
-                    size_t weightsBlockStride;
-
-                    if (upload.vktype == VKTYPE_Q4_0_SWZ) {
-                        scaleRowStride = 4;
-                        weightsRowStride = 32;
-                        scaleBlockStride = 4 * fullTensorElements[1];
-                        weightsBlockStride = 32 * fullTensorElements[1];
-                    } else {
-                        scaleRowStride = 4 * nDoubleBlocks;
-                        weightsRowStride = 32 * nDoubleBlocks;
-                        scaleBlockStride = 4;
-                        weightsBlockStride = 32;
-                    }
-
-                    if (tensor.splitType == SPLIT_PARTS_COLUMN) {
-                        tensorUploadScales += part * dstScaleBytes / tensorParts;
-                        tensorUploadWeights += part * dstWeightsBytes / tensorParts;
-                    } else {
-                        tensorUploadScales += part * 4 * fullTensorElements[1] / tensorParts;
-                        tensorUploadWeights += part * 32 * fullTensorElements[1] / tensorParts;
-                    }
-
-                    for (unsigned row = 0; row < tensor.numElementsPerPart[1]; ++row) {
-                        fin.read(cbuf, srcRowBytes);
-
-                        for (unsigned block = 0; block < nDoubleBlocks / tensorParts; ++block) {
-                            size_t scaleOffset = row * scaleRowStride + block * scaleBlockStride;
-                            size_t weightsOffset = row * weightsRowStride + block * weightsBlockStride;
-                            *(_Float16 *)(tensorUploadScales + scaleOffset + 0) = *(float *)(cbuf + block * 40 + 0);
-                            *(_Float16 *)(tensorUploadScales + scaleOffset + 2) = *(float *)(cbuf + block * 40 + 20);
-                            memcpy(tensorUploadWeights + weightsOffset +  0, cbuf + block * 40 + 4, 16);
-                            memcpy(tensorUploadWeights + weightsOffset + 16, cbuf + block * 40 + 24, 16);
-
-                            if (row == 0 && block < 2) {
-                                if (upload.name == "layers.0.attention.wq.weight") {
-                                    printf("Upload %s, part %u row %u block %u\n", upload.name.c_str(), part, row, block);
-                                    printf("  scales: %f %08x %f %08x\n",
-                                        *(float *)(cbuf + block * 40 + 0), *(int *)(cbuf + block * 40 + 0),
-                                        *(float *)(cbuf + block * 40 + 20), *(int *)(cbuf + block * 40 + 20));
-                                    printf("  converted: %08x\n", *(int *)(tensorUploadScales + scaleOffset));
-                                    int *w = (int *)(tensorUploadWeights + weightsOffset);
-                                    printf("  weights: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                                        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-                                }
-                            }
-                        }
-                    }
+                if (upload.vktype == VKTYPE_Q4_0_SWZ) {
+                    scaleRowStride = 4;
+                    weightsRowStride = 32;
+                    scaleBlockStride = 4 * ne[1];
+                    weightsBlockStride = 32 * ne[1];
                 } else {
-                    char * __restrict__ tensorUpload = (char *)buffer + uploadOffset;
-                    size_t dstRowBytes = vktypeSize(upload.vktype, fullTensorElements[0], 1);
-                    if (tensor.splitType == SPLIT_PARTS_COLUMN) {
-                        tensorUpload += part * (dstRowBytes / tensorParts);
-                    } else {
-                        tensorUpload += part * dstRowBytes * (fullTensorElements[1] / tensorParts);
-                    }
+                    scaleRowStride = 4 * nDoubleBlocks;
+                    weightsRowStride = 32 * nDoubleBlocks;
+                    scaleBlockStride = 4;
+                    weightsBlockStride = 32;
+                }
 
-                    assert(upload.vktype == VKTYPE_F16);
+                for (unsigned row = 0; row < tensor.ne[1]; ++row) {
+                    fin.read_raw(cbuf, srcRowBytes);
 
-                    switch (tensor.ftype) {
-                    case FTYPE_F16:
-                        for (unsigned row = 0; row < tensor.numElementsPerPart[1]; ++row) {
-                            char *rowUpload = tensorUpload + row * dstRowBytes;
-                            fin.read(rowUpload, srcRowBytes);
-                        }
-                        break;
-                    case FTYPE_F32:
-                        for (unsigned row = 0; row < tensor.numElementsPerPart[1]; ++row) {
-                            fin.read(cbuf, srcRowBytes);
-                            for (unsigned col = 0; col < tensor.numElementsPerPart[0]; ++col) {
-                                *(_Float16 *)(tensorUpload + row * dstRowBytes + 2 * col) = *(float *)(cbuf + 4 * col);
+                    for (unsigned block = 0; block < nDoubleBlocks; ++block) {
+                        size_t scaleOffset = row * scaleRowStride + block * scaleBlockStride;
+                        size_t weightsOffset = row * weightsRowStride + block * weightsBlockStride;
+                        *(_Float16 *)(tensorUploadScales + scaleOffset + 0) = *(float *)(cbuf + block * 40 + 0);
+                        *(_Float16 *)(tensorUploadScales + scaleOffset + 2) = *(float *)(cbuf + block * 40 + 20);
+                        memcpy(tensorUploadWeights + weightsOffset +  0, cbuf + block * 40 + 4, 16);
+                        memcpy(tensorUploadWeights + weightsOffset + 16, cbuf + block * 40 + 24, 16);
+
+                        if (row == 0 && block < 2) {
+                            if (upload.name == "layers.0.attention.wq.weight") {
+                                printf("Upload %s, row %u block %u\n", upload.name.c_str(), row, block);
+                                printf("  scales: %f %08x %f %08x\n",
+                                    *(float *)(cbuf + block * 40 + 0), *(int *)(cbuf + block * 40 + 0),
+                                    *(float *)(cbuf + block * 40 + 20), *(int *)(cbuf + block * 40 + 20));
+                                printf("  converted: %08x\n", *(int *)(tensorUploadScales + scaleOffset));
+                                int *w = (int *)(tensorUploadWeights + weightsOffset);
+                                printf("  weights: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
                             }
                         }
-                        break;
-                    default:
-                        abort();
                     }
+                }
+            } else {
+                char * __restrict__ tensorUpload = (char *)buffer + uploadOffset;
+                size_t dstRowBytes = vktypeSize(upload.vktype, ne[0], 1);
+
+                assert(upload.vktype == VKTYPE_F16);
+
+                switch (tensor.type) {
+                case GGML_TYPE_F16:
+                    fin.read_raw(tensorUpload, ne[1] * dstRowBytes);
+                    break;
+                case GGML_TYPE_F32:
+                    for (int row = 0; row < ne[1]; ++row) {
+                        fin.read_raw(cbuf, srcRowBytes);
+                        for (int col = 0; col < ne[0]; ++col) {
+                            *(_Float16 *)(tensorUpload + row * dstRowBytes + 2 * col) = *(float *)(cbuf + 4 * col);
+                        }
+                    }
+                    break;
+                default:
+                    abort();
                 }
             }
 
@@ -1978,7 +1804,6 @@ void LlamaContext::uploadModel() {
     fflush(stderr);
 
     m_uploader = std::make_unique<ModelUploader>(*this);
-    m_uploader->openAndScan();
 
     // Upload tensors.
     //
@@ -2525,15 +2350,6 @@ static void params_parse(int argc, char ** argv, llvk_params &params) {
     }
 }
 
-static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
-    // initialize to prompt number of chars, since n_tokens <= n_prompt_chars
-    std::vector<llama_token> res(text.size() + (int)add_bos);
-    int n = llama_tokenize(ctx, text.c_str(), res.data(), res.size(), add_bos);
-    assert(n >= 0);
-    res.resize(n);
-    return res;
-}
-
 int main(int argc, char **argv) {
     llvk_params params;
     params_parse(argc, argv, params);
@@ -2542,18 +2358,7 @@ int main(int argc, char **argv) {
 
     auto device = llvk::OwnedDevice::createDefault(vk);
 
-    llama_context_params ctx_params = {};
-    ctx_params.n_ctx = 2048;
-    ctx_params.n_parts = params.n_parts;
-    ctx_params.seed = params.seed;
-    ctx_params.vocab_only = true;
-
-    llama_file_info model_file_info;
-    llama_context *ctx = llama_init_from_file(params.model.c_str(), ctx_params, &model_file_info);
-    if (!ctx)
-        exit(1);
-
-    llvk::LlamaContext vkctx(vk, device, params.model, model_file_info, params.seed, 2048);
+    llvk::LlamaContext vkctx(vk, device, params.model, params.seed, 2048);
 
     vkctx.uploadModel();
 
@@ -2561,19 +2366,19 @@ int main(int argc, char **argv) {
     params.prompt.insert(0, 1, ' ');
 
     // Tokenize the prompt
-    auto embd_inp = llama_tokenize(ctx, params.prompt.c_str(), true);
+    auto embd_inp = llama_tokenize(vkctx.vocab(), params.prompt, true);
 
     printf("Initial embd_inp:\n");
     for (const auto &token : embd_inp)
-        printf("  %u: '%s'\n", token, llama_token_to_str(ctx, token));
+        printf("  %u: '%s'\n", token, vkctx.tokenToStr(token));
     printf("--\n");
 
-    for (unsigned count = 0; count < params.n_predict; ++count) {
+    for (int count = 0; count < params.n_predict; ++count) {
         llama_token next = vkctx.process(embd_inp.data(), embd_inp.size());
 #if 1
-        printf("%s", llama_token_to_str(ctx, next));
+        printf("%s", vkctx.tokenToStr(next));
 #else
-        printf(" %5u: '%s'\n", next, llama_token_to_str(ctx, next));
+        printf(" %5u: '%s'\n", next, vkctx.tokenToStr(next));
 #endif
         fflush(stdout);
 
