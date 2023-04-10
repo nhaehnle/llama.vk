@@ -5,6 +5,7 @@
 .vscode/
 .DS_Store
 
+.build/
 build/
 build-em/
 build-debug/
@@ -18,9 +19,13 @@ models/*
 
 /main
 /quantize
+/quantize-stats
 /result
 /perplexity
+/embedding
+/Pipfile
 /llama-vk
+
 /vulkan/*.spv
 
 arm_neon.h
@@ -28,3 +33,10 @@ compile_commands.json
 
 .envrc
 .direnv/
+
+.venv
+__pycache__
+.swiftpm
+
+zig-out/
+zig-cache/

@@ -68,7 +68,9 @@ option(LLAMA_BUILD_EXAMPLES         "llama: build examples" ${LLAMA_STANDALONE})
 # Compile flags
 #
 
+set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED true)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED true)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -113,6 +115,7 @@ if (LLAMA_OPENBLAS)
 
         add_compile_definitions(GGML_USE_OPENBLAS)
         add_link_options(${BLAS_LIBRARIES})
+        set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} openblas)
     else()
         message(WARNING "OpenBLAS not found")
     endif()
@@ -124,8 +127,9 @@ if (LLAMA_ALL_WARNINGS)
             -Wall
             -Wextra
             -Wpedantic
-            -Wshadow
             -Wcast-qual
+            -Wdouble-promotion
+            -Wshadow
             -Wstrict-prototypes
             -Wpointer-arith
             -Wno-unused-function
@@ -135,6 +139,8 @@ if (LLAMA_ALL_WARNINGS)
             -Wextra
             -Wpedantic
             -Wcast-qual
+            -Wno-unused-function
+            -Wno-multichar
         )
     else()
         # todo : msvc
@@ -145,6 +151,10 @@ if (LLAMA_ALL_WARNINGS)
             "$<$<COMPILE_LANGUAGE:CXX>:${cxx_flags}>"
     )
 
+endif()
+
+if (MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
 if (LLAMA_LTO)
@@ -236,7 +246,9 @@ endif()
 
 add_library(llama
             llama.cpp
-            llama.h)
+            llama.h
+            llama_internal.h
+            llama_util.h)
 
 target_include_directories(llama PUBLIC .)
 target_compile_features(llama PUBLIC cxx_std_11) # don't bump
@@ -251,7 +263,7 @@ endif()
 #
 
 if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
-    enable_testing()
+    include(CTest)
     add_subdirectory(tests)
 endif ()
 
