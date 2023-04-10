@@ -39,6 +39,13 @@ struct OutputScratch {
     uint padding2[63];
 };
 
+struct UploadPushConstants {
+    uint numElements[2];
+    uint numWorkgroups;
+    uint rowBegin;
+    uint rowCount;
+};
+
 #ifdef LLAMA_HOST
 }
 #endif

@@ -67,6 +67,11 @@ half ashalf(uint16_t x);
 [[vk::binding(9, 1)]] ByteAddressBuffer bufferW2;
 [[vk::binding(10, 1)]] ByteAddressBuffer bufferW3;
 
+[[vk::push_constant]] UploadPushConstants g_upload;
+
+[[vk::binding(0, 0)]] ByteAddressBuffer uploadSrc;
+[[vk::binding(1, 0)]] RWByteAddressBuffer uploadDst;
+
 #define NUM_WGP_THREADS 256 // multiple of a wave size!
 
 groupshared float gRmsScratch[NUM_WGP_THREADS];
@@ -249,7 +254,7 @@ void KernelThinFp16FirstRmsNorm(uint3 localTid : SV_GroupThreadID) {
             }
 
 #if DEBUG_FIRST_RMS_NORM
-            if (tid < 4) {
+            if (tid >= 191 && tid <= 193) {
                 printf("tid: %u token: %u, baseScales: %u baseWeights: %u\n", tid, g_constants.currentToken, baseScales, baseWeights);
                 printf("tid: %u doubleBlockIdx: %u, scale: %f, weights: %v4x\n", tid, doubleBlockIdx, (float)scale, weights);
             }
@@ -277,7 +282,7 @@ void KernelThinFp16FirstRmsNorm(uint3 localTid : SV_GroupThreadID) {
         }
 
 #if DEBUG_FIRST_RMS_NORM
-        if (tid < 2) {
+        if (tid >= 191 && tid <= 193) {
             printf("tid: %u, numThreads: %u, per lane: %u %v2f %v2f %v2f %v2f\n", tid, numThreads, rmsNEmbdPerLane,
                 (float2)activations[0], (float2)activations[1], (float2)activations[2], (float2)activations[3]);
         }
@@ -1376,3 +1381,190 @@ void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThrea
 
     bufferResult[0].token = token;
 }
+
+#define NUM_UPLOAD_THREADS 256
+
+// Upload data linearly while converting from F32 to F16.
+//
+// Requires 1D numElements, multiple of 4 elements.
+//
+// 8kiB of loads in flight per workgroup.
+[numthreads(NUM_UPLOAD_THREADS, 1, 1)]
+void KernelUploadF32toF16(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
+    uint fetchStride = NUM_UPLOAD_THREADS * 4;
+    uint outerStride = fetchStride * 2 * g_upload.numWorkgroups;
+    uint index = 4 * (gid.x * 2 * NUM_UPLOAD_THREADS + localTid.x);
+
+    while (index + fetchStride < g_upload.numElements[0]) {
+        float4 load[2];
+        load[0] = uploadSrc.Load<float4>(4 * (index + 0));
+        load[1] = uploadSrc.Load<float4>(4 * (index + fetchStride));
+        uploadDst.Store<half4>(2 * (index +           0), (half4)load[0]);
+        uploadDst.Store<half4>(2 * (index + fetchStride), (half4)load[1]);
+        index += outerStride;
+    }
+
+    if (index < g_upload.numElements[0]) {
+        float4 load = uploadSrc.Load<float4>(4 * index);
+        uploadDst.Store<half4>(2 * index, (half4)load[0]);
+    }
+}
+
+// Offsets are relative to the start of the copy region.
+void copyQ4DoubleBlock(uint srcOffset, uint dstScaleOffset, uint dstWeightsOffset) {
+    uint dwords[10];
+    uint i;
+
+    [[unroll]] for (i = 0; i < 10; ++i)
+        dwords[i] = uploadSrc.Load<uint>(srcOffset + 4 * i);
+
+    half2 scale;
+    uint4 weights[2];
+    scale.x = (half)asfloat(dwords[0]);
+    scale.y = (half)asfloat(dwords[5]);
+    [[unroll]] for (i = 0; i < 4; ++i) {
+        weights[0][i] = dwords[1 + i];
+        weights[1][i] = dwords[6 + i];
+    }
+
+    uploadDst.Store<half2>(dstScaleOffset, scale);
+    uploadDst.Store<uint4>(dstWeightsOffset +  0, weights[0]);
+    uploadDst.Store<uint4>(dstWeightsOffset + 16, weights[1]);
+}
+
+// Upload Q4_0 from file format to a linear layout.
+//
+// Requires 2D numElements, numElements[0] must be a multiple of 64.
+//
+// Each thread handles a double block at a time (40 bytes -> 36 bytes).
+//
+// 10kiB of loads in flight per workgroup.
+[numthreads(NUM_UPLOAD_THREADS, 1, 1)]
+void KernelUploadQ4_0_linear(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
+    uint doubleBlocksPerRow = g_upload.numElements[0] / 64;
+    uint numScaleBytes = doubleBlocksPerRow * g_upload.numElements[1] * 4;
+
+    uint blockCount = g_upload.rowCount * doubleBlocksPerRow;
+    uint blockStride = NUM_UPLOAD_THREADS * g_upload.numWorkgroups;
+
+    uint dstScaleBase = 0;
+    uint dstWeightsBase = numScaleBytes;
+
+    uint blockIdx = NUM_UPLOAD_THREADS * gid.x + localTid.x;
+
+    while (blockIdx < blockCount) {
+        uint srcOffset = blockIdx * 40;
+        uint dstScaleOffset   = dstScaleBase   + (g_upload.rowBegin * doubleBlocksPerRow + blockIdx) * 4;
+        uint dstWeightsOffset = dstWeightsBase + (g_upload.rowBegin * doubleBlocksPerRow + blockIdx) * 32;
+        copyQ4DoubleBlock(srcOffset, dstScaleOffset, dstWeightsOffset);
+
+        blockIdx += blockStride;
+    }
+}
+
+// Upload Q4_0 from file format to a swizzled layout.
+//
+// numElements[0] must be a multiple of 64.
+// numElements[1] must be a multiple of 16.
+//
+// Each thread handles a double block at a time (40 bytes -> 36 bytes).
+// We're loading a 16x16 tile of double blocks at a time (corresponds to
+// 16x1024 elements).
+//
+// 10kiB of loads in flight per workgroup.
+#if 0
+[numthreads(NUM_UPLOAD_THREADS, 1, 1)]
+void KernelUploadQ4_0_swz(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
+    uint doubleBlocksPerRow = g_upload.numElements[0] / 64;
+    uint srcRowBytes = doubleBlocksPerRow * 40;
+    uint numScaleBytes = doubleBlocksPerRow * g_upload.numElements[1] * 4;
+    uint rowStride = 16 * g_upload.numWorkgroups;
+
+    uint row = 16 * gid.x + localTid.x / 16;
+
+    while (row < rowCount) {
+        uint col = localTid.x % 16;
+
+        while (col < doubleBlocksPerRow) {
+            uint srcOffset = srcRowBytes * row + col * 40;
+            uint dstScaleOffset   =                  4 * (g_upload.rowBegin + row + col * g_upload.numElements[1]);
+            uint dstWeightsOffset = numScaleBytes + 32 * (g_upload.rowBegin + row + col * g_upload.numElements[1]);
+
+            copyQ4DoubleBlock(srcOffset, dstScaleOffset, dstWeightsOffset);
+
+            col += 16;
+        }
+
+        row += rowStride;
+    }
+}
+#else
+groupshared half2 g_uploadScaleBuffer[16 * 16];
+
+[numthreads(NUM_UPLOAD_THREADS, 1, 1)]
+void KernelUploadQ4_0_swz(uint3 gid : SV_GroupID, uint3 localTid : SV_GroupThreadID) {
+    uint doubleBlocksPerRow = g_upload.numElements[0] / 64;
+    uint srcRowBytes = doubleBlocksPerRow * 40;
+    uint numScaleBytes = doubleBlocksPerRow * g_upload.numElements[1] * 4;
+    uint rowStride = 16 * g_upload.numWorkgroups;
+
+    uint groupRow = 16 * gid.x;
+
+    while (groupRow < g_upload.rowCount) {
+        uint groupCol = 0;
+
+        while (groupCol < doubleBlocksPerRow) {
+            uint localRow = localTid.x / 16;
+            uint localCol = localTid.x % 16;
+            uint col = groupCol + localCol;
+            uint row = groupRow + localRow;
+
+            if (col < doubleBlocksPerRow) {
+                uint srcOffset = srcRowBytes * row + col * 40;
+                uint dstWeightsOffset = numScaleBytes + 32 * (g_upload.rowBegin + row + col * g_upload.numElements[1]);
+
+                uint dwords[10];
+                uint i;
+
+                [[unroll]] for (i = 0; i < 10; ++i)
+                    dwords[i] = uploadSrc.Load<uint>(srcOffset + 4 * i);
+
+                half2 scale;
+                uint4 weights[2];
+                scale.x = (half)asfloat(dwords[0]);
+                scale.y = (half)asfloat(dwords[5]);
+                [[unroll]] for (i = 0; i < 4; ++i) {
+                    weights[0][i] = dwords[1 + i];
+                    weights[1][i] = dwords[6 + i];
+                }
+
+                uploadDst.Store<uint4>(dstWeightsOffset +  0, weights[0]);
+                uploadDst.Store<uint4>(dstWeightsOffset + 16, weights[1]);
+
+                // Swizzle to reduce bank conflicts.
+                g_uploadScaleBuffer[17 * localRow ^ localCol] = scale;
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            localRow = localTid.x % 16;
+            localCol = localTid.x / 16;
+            col = groupCol + localCol;
+            row = groupRow + localRow;
+
+            half2 scale = g_uploadScaleBuffer[17 * localRow ^ localCol];
+
+            GroupMemoryBarrierWithGroupSync();
+
+            if (col < doubleBlocksPerRow) {
+                uint dstScaleOffset = 4 * (g_upload.rowBegin + row + col * g_upload.numElements[1]);
+                uploadDst.Store<half2>(dstScaleOffset, scale);
+            }
+
+            groupCol += 16;
+        }
+
+        groupRow += rowStride;
+    }
+}
+#endif

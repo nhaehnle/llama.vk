@@ -186,7 +186,10 @@ KERNELS := \
 	KernelThinFp16FirstRmsNorm \
 	KernelThinFp16Output \
 	KernelThinFp16MatMulAdd \
-	KernelThinFp16RmsNorm
+	KernelThinFp16RmsNorm \
+	KernelUploadF32toF16 \
+	KernelUploadQ4_0_linear \
+	KernelUploadQ4_0_swz
 
 llama-vk: vulkan/llama-vk.cpp ggml.o llama.o $(KERNELS:%=vulkan/%.spv)
 	$(CXX) $(CXXFLAGS) vulkan/llama-vk.cpp ggml.o llama.o -lvulkan -o llama-vk
