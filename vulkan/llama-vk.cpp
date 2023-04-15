@@ -46,16 +46,16 @@ static std::string formatNumBytes(uint64_t numBytes) {
     static const char *units[] = {
         "B", "kiB", "MiB", "GiB", "TiB", nullptr,
     };
-    uint64_t quantity = numBytes;
+    double quantity = numBytes;
     unsigned unit = 0;
 
     while (units[unit + 1] && quantity >= 4 * 1024) {
-        quantity = (quantity + 1024 - 1) / 1024;
+        quantity *= 1.0 / 1024.0;
         ++unit;
     }
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f%s", (float)quantity, units[unit]);
+    snprintf(buf, sizeof(buf), "%.2f%s", quantity, units[unit]);
     return buf;
 }
 
@@ -926,14 +926,15 @@ static const VkSpecializationMapEntry g_specMapEntries[] = {
 static const VkDescriptorSetLayoutBinding g_dsetLayoutGlobal[] = {
     { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // constants
     { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // history indices
-    { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // embedding weights
-    { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations bypass
-    { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage1
-    { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage2
-    { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // model norm
-    { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // model output
-    { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // output scratch
-    { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // result
+    { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // history tokens
+    { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // embedding weights
+    { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations bypass
+    { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage1
+    { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // activations stage2
+    { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // model norm
+    { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // model output
+    { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // output scratch
+    { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // result
 };
 
 static const VkDescriptorSetLayoutBinding g_dsetLayoutPerLayer[] = {
@@ -955,6 +956,14 @@ static const VkDescriptorSetLayoutBinding g_dsetLayoutUpload[] = {
     { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // destination
 };
 
+struct SampleParameters {
+    unsigned topK = 40;
+    float topP = 0.95;
+    float temp  = 0.80f;
+    unsigned repeatLastN = 64; // number of previous tokens to penalize
+    float repeatPenalty = 2.0f;
+};
+
 class LlamaContext {
     struct ModelUploader;
 public:
@@ -962,14 +971,14 @@ public:
                  int seed, unsigned maxCacheEntries);
     ~LlamaContext();
 
-    void uploadModel();
+    void uploadModel(bool useMmap, bool cpuCopy);
 
     const llama_vocab &vocab() const { return m_loader->loader.vocab; }
     const char *tokenToStr(llama_vocab::id id) const {
         return m_loader->loader.vocab.id_to_token[id].tok.c_str();
     }
 
-    llama_token process(const llama_token *token, size_t numTokens);
+    llama_token process(const llama_token *token, size_t numTokens, const SampleParameters &params);
 
 private:
     struct WriteHistoryIndex {
@@ -1026,6 +1035,7 @@ private:
         uint64_t size = 0;
         Range constants[2];
         Range historyIndex;
+        Range historyTokens;
         Range embedding;
         Range modelNorm;
         Range modelOutput;
@@ -1229,6 +1239,7 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
         OFFSET(m_globalOffsets, constants[0], sizeof(shader::GlobalConstantBuffer));
         OFFSET(m_globalOffsets, constants[1], sizeof(shader::GlobalConstantBuffer));
         OFFSET(m_globalOffsets, historyIndex, 4 * m_specData.nCtx);
+        OFFSET(m_globalOffsets, historyTokens, 4 * m_specData.nCtx);
 
         uint64_t embdMatrixSize = vktypeSize(VKTYPE_Q4_0_LINEAR, m_specData.nEmbd, m_specData.nVocab);
         OFFSET(m_globalOffsets, embedding, embdMatrixSize);
@@ -1297,14 +1308,15 @@ LlamaContext::LlamaContext(Instance &vk, Device &device, const std::string &mode
         for (unsigned i = 0; i < globalSets; ++i) {
             write.writeUniform(m_dsetGlobal[i], 0, m_globalMemory.buffer(), m_globalOffsets.constants[i]);
             write.writeStorage(m_dsetGlobal[i], 1, m_globalMemory.buffer(), m_globalOffsets.historyIndex);
-            write.writeStorage(m_dsetGlobal[i], 2, m_globalMemory.buffer(), m_globalOffsets.embedding);
-            write.writeStorage(m_dsetGlobal[i], 3, m_globalMemory.buffer(), m_globalOffsets.bypass);
-            write.writeStorage(m_dsetGlobal[i], 4, m_globalMemory.buffer(), m_globalOffsets.stage1);
-            write.writeStorage(m_dsetGlobal[i], 5, m_globalMemory.buffer(), m_globalOffsets.stage2);
-            write.writeStorage(m_dsetGlobal[i], 6, m_globalMemory.buffer(), m_globalOffsets.modelNorm);
-            write.writeStorage(m_dsetGlobal[i], 7, m_globalMemory.buffer(), m_globalOffsets.modelOutput);
-            write.writeStorage(m_dsetGlobal[i], 8, m_globalMemory.buffer(), m_globalOffsets.outputScratch);
-            write.writeStorage(m_dsetGlobal[i], 9, m_globalMemory.buffer(), m_globalOffsets.result);
+            write.writeStorage(m_dsetGlobal[i], 2, m_globalMemory.buffer(), m_globalOffsets.historyTokens);
+            write.writeStorage(m_dsetGlobal[i], 3, m_globalMemory.buffer(), m_globalOffsets.embedding);
+            write.writeStorage(m_dsetGlobal[i], 4, m_globalMemory.buffer(), m_globalOffsets.bypass);
+            write.writeStorage(m_dsetGlobal[i], 5, m_globalMemory.buffer(), m_globalOffsets.stage1);
+            write.writeStorage(m_dsetGlobal[i], 6, m_globalMemory.buffer(), m_globalOffsets.stage2);
+            write.writeStorage(m_dsetGlobal[i], 7, m_globalMemory.buffer(), m_globalOffsets.modelNorm);
+            write.writeStorage(m_dsetGlobal[i], 8, m_globalMemory.buffer(), m_globalOffsets.modelOutput);
+            write.writeStorage(m_dsetGlobal[i], 9, m_globalMemory.buffer(), m_globalOffsets.outputScratch);
+            write.writeStorage(m_dsetGlobal[i], 10, m_globalMemory.buffer(), m_globalOffsets.result);
         }
 
         for (unsigned i = 0; i < m_numLayers; ++i) {
@@ -1493,8 +1505,9 @@ private:
     };
 
     LlamaContext &ctx;
+    llama_mmap *mmap = nullptr;
     bool m_needQueueTransfers = false;
-    UploadMode m_mode = UploadMode::DeviceMemory;
+    UploadMode m_mode = UploadMode::SystemMemory;
     VkDescriptorPool m_descriptorPool = nullptr;
     VkCommandPool m_commandPool = nullptr;
     SubmitContext m_sctx[2];
@@ -1521,7 +1534,10 @@ private:
     void flush();
 
 public:
-    ModelUploader(LlamaContext &ctx) : ctx(ctx) { init(); }
+    ModelUploader(LlamaContext &ctx, UploadMode mode, llama_mmap *mmap)
+        : ctx(ctx), mmap(mmap), m_mode(mode) {
+        init();
+    }
     ~ModelUploader() { finish(); }
 
     size_t totalSrcSize() const { return m_totalSrcSize; }
@@ -1548,7 +1564,7 @@ void LlamaContext::ModelUploader::init() {
     }
 
     // 64MB is (realistically, a bit more than) 2ms of PCIe v4 bandwidth.
-    size_t contextSizeGoal = 4 * 1024 * 1024;
+    size_t contextSizeGoal = 64 * 1024 * 1024;
 
     if (m_mode == UploadMode::DeviceMemory) {
         m_uploadContextSize = std::min(ctx.device.uploadHeapSize() / 4, contextSizeGoal);
@@ -1837,9 +1853,14 @@ void LlamaContext::ModelUploader::flush() {
                 srcRange.range = rowCount * srcRowBytes;
                 assert(m_uploadOffset + srcRange.range <= m_uploadContextSize);
 
-                auto &fin = ctx.m_loader->loader.file;
-                fin.seek(tensor.shards[0].file_off + m_partialUpload * srcRowBytes, SEEK_SET);
-                fin.read_raw((char *)buffer + m_uploadOffset, rowCount * srcRowBytes);
+                size_t fileOffset = tensor.shards[0].file_off + m_partialUpload * srcRowBytes;
+                if (mmap) {
+                    memcpy((char *)buffer + m_uploadOffset, (char *)mmap->addr + fileOffset, rowCount * srcRowBytes);
+                } else {
+                    auto &fin = ctx.m_loader->loader.file;
+                    fin.seek(fileOffset, SEEK_SET);
+                    fin.read_raw((char *)buffer + m_uploadOffset, rowCount * srcRowBytes);
+                }
 
                 Range dstRange = upload.range;
                 if (upload.vktype == VKTYPE_F16) {
@@ -1867,9 +1888,14 @@ void LlamaContext::ModelUploader::flush() {
                 // Direct copy from file
                 assert(upload.vktype == VKTYPE_F16 && tensor.type == GGML_TYPE_F16);
 
-                auto &fin = ctx.m_loader->loader.file;
-                fin.seek(tensor.shards[0].file_off + m_partialUpload * srcRowBytes, SEEK_SET);
-                fin.read_raw((char *)buffer + m_uploadOffset, rowCount * srcRowBytes);
+                size_t fileOffset = tensor.shards[0].file_off + m_partialUpload * srcRowBytes;
+                if (mmap) {
+                    memcpy((char *)buffer + m_uploadOffset, (char *)mmap->addr + fileOffset, rowCount * srcRowBytes);
+                } else {
+                    auto &fin = ctx.m_loader->loader.file;
+                    fin.seek(fileOffset, SEEK_SET);
+                    fin.read_raw((char *)buffer + m_uploadOffset, rowCount * srcRowBytes);
+                }
 
                 // Setup the copy command.
                 if (currentDstBuffer && currentDstBuffer != upload.buffer)
@@ -1959,13 +1985,26 @@ void LlamaContext::ModelUploader::flush() {
     fflush(stderr);
 }
 
-void LlamaContext::uploadModel() {
+void LlamaContext::uploadModel(bool useMmap, bool cpuCopy) {
     fprintf(stderr, "llama-vk: uploading");
     fflush(stderr);
 
+    std::unique_ptr<llama_mmap> mmap;
+
+    if (useMmap) {
+        if (!llama_mmap::SUPPORTED) {
+            fprintf(stderr, "mmap requested, but not supported\n");
+            exit(1);
+        }
+
+        mmap = std::make_unique<llama_mmap>(&m_loader->loader.file);
+    }
+
     int64_t start_us = ggml_time_us();
 
-    m_uploader = std::make_unique<ModelUploader>(*this);
+    m_uploader = std::make_unique<ModelUploader>(
+            *this, cpuCopy ? UploadMode::DeviceMemory : UploadMode::SystemMemory,
+            mmap.get());
 
     // Upload tensors.
     //
@@ -2090,6 +2129,14 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
 
     vk.CmdUpdateBuffer(cmdBuf, m_globalMemory.buffer(), m_globalOffsets.constants[m_numPasses % 2].offset,
                        sizeof(constants), &constants);
+
+    {
+        unsigned group = constants.currentHistoryBase / m_specData.nCtx;
+        unsigned idx = (constants.currentHistoryBase + constants.currentHistoryLength) % m_specData.nCtx;
+        vk.CmdUpdateBuffer(cmdBuf, m_globalMemory.buffer(),
+                           m_globalOffsets.historyTokens.offset + 4 * (group * m_specData.nCtx + idx),
+                           4, &constants.currentToken);
+    }
 
     vk.utilCmdPipelineMemoryBarrier(cmdBuf,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -2279,12 +2326,13 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
                                  m_hostOffsets.debugActivations.range);
 
         fprintf(stderr, "Debug activations:\n");
+        uint w = 8;
         for (unsigned i = 0; i < 4096; ++i) {
-            if (i % 16 == 0)
+            if (i % w == 0)
                 fprintf(stderr, "%4u:", i);
             float val = *((_Float16 *)activations + i);
             fprintf(stderr, " %+8f", val);
-            if (i % 16 == 15)
+            if (i % w == w - 1)
                 fprintf(stderr, "\n");
         }
 
@@ -2292,13 +2340,18 @@ void LlamaContext::submitPass(const shader::GlobalConstantBuffer &constants, con
     }
 }
 
-llama_token LlamaContext::process(const llama_token *tokens, size_t numTokens) {
+llama_token LlamaContext::process(const llama_token *tokens, size_t numTokens,
+                                  const SampleParameters &params) {
     shader::GlobalConstantBuffer constants = {};
     constants.rmsEpsilon = 1e-6f;
     constants.numKeyValueEntries = m_maxCacheEntries;
-    constants.topK = 40;
-    constants.topP = 0.95;
-    constants.temp = 0.8;
+    constants.topK = params.topK;
+    constants.topP = params.topP;
+    constants.temp = params.temp;
+    constants.repeatLastN = params.repeatLastN;
+    constants.repeatPenalty = params.repeatPenalty;
+    if (constants.repeatPenalty <= 0.0)
+        constants.repeatLastN = 0;
 
     std::uniform_real_distribution<> unit(0.0, 1.0);
     constants.rand = unit(m_rng);
@@ -2344,12 +2397,14 @@ struct llvk_params {
     float   top_p = 0.95f;
     float   temp  = 0.80f;
     int32_t repeat_last_n = 64;   // last n tokens to penalize
-    float   repeat_penalty  = 1.10f;
+    float   repeat_penalty  = 3.00f;
 
     // driver parameters
     std::string prompt = "";
     int32_t n_predict = 128; // max. num tokens to predict
 
+    bool use_mmap          = llama_mmap::SUPPORTED;
+    bool cpu_copy          = false; // CPU copies from system to device memory
     bool memory_f16        = true;  // use f16 instead of f32 for memory kv
     bool use_color         = false; // use color to distinguish generations and inputs
     bool interactive       = false; // interactive mode
@@ -2388,6 +2443,9 @@ static void print_usage(int /*argc*/, char ** argv, const llvk_params & params) 
     fprintf(stderr, "  --n_parts N           number of model parts (default: -1 = determine from dimensions)\n");
     fprintf(stderr, "  --perplexity          compute perplexity over the prompt\n");
     fprintf(stderr, "  --mtest               compute maximum memory usage\n");
+    fprintf(stderr, "  --no-mmap             disable mmap (default: %s)\n", llama_mmap::SUPPORTED ? "enabled" : "disabled");
+    fprintf(stderr, "  --cpu-copy            use CPU to copy to GPU memory for initial upload\n"
+                    "                        (default: GPU fetches from system memory)\n");
     fprintf(stderr, "  --verbose-prompt      print prompt before generation\n");
     fprintf(stderr, "  -m FNAME, --model FNAME\n");
     fprintf(stderr, "                        model path\n");
@@ -2484,6 +2542,10 @@ static void params_parse(int argc, char ** argv, llvk_params &params) {
             params.perplexity = true;
         } else if (arg == "--ignore-eos") {
             params.ignore_eos = true;
+        } else if (arg == "--no-mmap") {
+            params.use_mmap = false;
+        } else if (arg == "--cpu-copy") {
+            params.cpu_copy = true;
         } else if (arg == "--n_parts") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -2522,8 +2584,14 @@ int main(int argc, char **argv) {
     auto device = llvk::OwnedDevice::createDefault(vk);
 
     llvk::LlamaContext vkctx(vk, device, params.model, params.seed, 2048);
+    llvk::SampleParameters sampleParams;
+    sampleParams.topK = params.top_k;
+    sampleParams.topP = params.top_p;
+    sampleParams.temp = params.temp;
+    sampleParams.repeatLastN = params.repeat_last_n;
+    sampleParams.repeatPenalty = params.repeat_penalty;
 
-    vkctx.uploadModel();
+    vkctx.uploadModel(params.use_mmap, params.cpu_copy);
 
     // Add a space in front of the first character to match OG llama tokenizer behavior
     params.prompt.insert(0, 1, ' ');
@@ -2536,8 +2604,14 @@ int main(int argc, char **argv) {
         printf("  %u: '%s'\n", token, vkctx.tokenToStr(token));
     printf("--\n");
 
+    int64_t total_processing_us = 0;
+    int numTokens = 0;
+
     for (int count = 0; count < params.n_predict; ++count) {
-        llama_token next = vkctx.process(embd_inp.data(), embd_inp.size());
+        int64_t start = ggml_time_us();
+        llama_token next = vkctx.process(embd_inp.data(), embd_inp.size(), sampleParams);
+        total_processing_us += ggml_time_us() - start;
+        numTokens += embd_inp.size();
 #if 1
         printf("%s", vkctx.tokenToStr(next));
 #else
@@ -2551,6 +2625,11 @@ int main(int argc, char **argv) {
         embd_inp.clear();
         embd_inp.push_back(next);
     }
+    printf("\n");
+
+    fprintf(stderr, "processed %d tokens in %.02fs (%.1fms per token)\n",
+            numTokens, (double)total_processing_us / 1000000,
+            (double)total_processing_us / numTokens / 1000.0);
 
     return 0;
 }

@@ -36,22 +36,21 @@ half ashalf(uint16_t x);
 [[vk::constant_id(5)]] const float specRotaryTheta = 10000.0;
 [[vk::constant_id(10)]] const uint specMode = 0; // meaning depends on the kernel
 
-[[vk::binding(0, 0)]] cbuffer ForwardPassConstants {
-    GlobalConstantBuffer g_constants;
-};
+[[vk::binding(0, 0)]] ConstantBuffer<GlobalConstantBuffer> g_constants;
 
 [[vk::binding(1, 0)]] ByteAddressBuffer bufferHistoryIndex;
-[[vk::binding(2, 0)]] ByteAddressBuffer bufferEmbedding;
+[[vk::binding(2, 0)]] RWByteAddressBuffer bufferHistoryTokens;
+[[vk::binding(3, 0)]] ByteAddressBuffer bufferEmbedding;
 
-[[vk::binding(3, 0)]] RWByteAddressBuffer bufferBypass;
-[[vk::binding(4, 0)]] RWByteAddressBuffer bufferStage1;
-[[vk::binding(5, 0)]] RWByteAddressBuffer bufferStage2;
+[[vk::binding(4, 0)]] RWByteAddressBuffer bufferBypass;
+[[vk::binding(5, 0)]] RWByteAddressBuffer bufferStage1;
+[[vk::binding(6, 0)]] RWByteAddressBuffer bufferStage2;
 
-[[vk::binding(6, 0)]] ByteAddressBuffer bufferModelNorm;
-[[vk::binding(7, 0)]] ByteAddressBuffer bufferModelOutput;
+[[vk::binding(7, 0)]] ByteAddressBuffer bufferModelNorm;
+[[vk::binding(8, 0)]] ByteAddressBuffer bufferModelOutput;
 
-[[vk::binding(8, 0)]] RWStructuredBuffer<OutputScratch> bufferOutputScratch;
-[[vk::binding(9, 0)]] RWStructuredBuffer<ResultBuffer> bufferResult;
+[[vk::binding(9, 0)]] RWStructuredBuffer<OutputScratch> bufferOutputScratch;
+[[vk::binding(10, 0)]] RWStructuredBuffer<ResultBuffer> bufferResult;
 
 [[vk::binding(0, 1)]] ByteAddressBuffer bufferAttentionNorm;
 [[vk::binding(1, 1)]] ByteAddressBuffer bufferWq;
@@ -112,9 +111,6 @@ void rmsNormBottomHalf(uint tid, uint numThreads, uint numPerLane, inout half2 a
 
     // Write activations out to memory
     half scale = half(1.0 / sqrt(g_constants.rmsEpsilon + mean));
-
-    // if (tid == 0)
-    //     printf("RMS scale: %f\n", (float)scale);
 
     [[unroll]] for (uint idx = 0; idx < numPerLane / 2; ++idx)
         activations[idx] *= scale;
@@ -248,13 +244,13 @@ void KernelThinFp16FirstRmsNorm(uint3 localTid : SV_GroupThreadID) {
             half scale = scales[subBlockIdx / 2];
             uint4 weights;
             if (rmsNEmbdPerLane == 32) {
-                weights = bufferEmbedding.Load<uint4>(baseWeights + 32 * doubleBlockIdx);
+                weights = bufferEmbedding.Load<uint4>(baseWeights + 32 * doubleBlockIdx + 8 * subBlockIdx);
             } else {
                 weights.xy = bufferEmbedding.Load<uint2>(baseWeights + 32 * doubleBlockIdx + 8 * subBlockIdx);
             }
 
 #if DEBUG_FIRST_RMS_NORM
-            if (tid >= 191 && tid <= 193) {
+            if (tid < 2) {
                 printf("tid: %u token: %u, baseScales: %u baseWeights: %u\n", tid, g_constants.currentToken, baseScales, baseWeights);
                 printf("tid: %u doubleBlockIdx: %u, scale: %f, weights: %v4x\n", tid, doubleBlockIdx, (float)scale, weights);
             }
@@ -282,7 +278,7 @@ void KernelThinFp16FirstRmsNorm(uint3 localTid : SV_GroupThreadID) {
         }
 
 #if DEBUG_FIRST_RMS_NORM
-        if (tid >= 191 && tid <= 193) {
+        if (tid < 2) {
             printf("tid: %u, numThreads: %u, per lane: %u %v2f %v2f %v2f %v2f\n", tid, numThreads, rmsNEmbdPerLane,
                 (float2)activations[0], (float2)activations[1], (float2)activations[2], (float2)activations[3]);
         }
@@ -1104,6 +1100,23 @@ void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThrea
     g_output.tmp1 = 0;
     g_output.tmp2 = 0;
 
+    if (g_constants.repeatLastN != 0) {
+        g_output.pool1[tid] = 0;
+
+        GroupMemoryBarrierWithGroupSync();
+
+        uint lastN = min(g_constants.repeatLastN, g_constants.currentHistoryLength + 1);
+        if (tid < lastN) {
+            uint group = g_constants.currentHistoryBase / specNCtx;
+            uint idx = (g_constants.currentHistoryBase + g_constants.currentHistoryLength + specNCtx - tid) % specNCtx;
+            uint token = bufferHistoryTokens.Load<uint>(4 * (group * specNCtx + idx));
+            uint base = NUM_OUTPUT_THREADS * gid.x;
+
+            if (base <= token && token < base + NUM_OUTPUT_THREADS)
+                g_output.pool1[token - base] = 1;
+        }
+    }
+
     GroupMemoryBarrierWithGroupSync();
 
     // Step 1: Multiply with output matrix and build local histogram.
@@ -1111,6 +1124,12 @@ void KernelThinFp16Output(uint2 gid : SV_GroupID, uint3 localTid : SV_GroupThrea
     {
         uint token = NUM_OUTPUT_THREADS * gid.x + tid;
         float weight = thinMatMul(2, token, 0);
+
+        if (g_constants.repeatLastN != 0) {
+            uint base = NUM_OUTPUT_THREADS * gid.x;
+            if (g_output.pool1[token - base] != 0)
+                weight -= g_constants.repeatPenalty;
+        }
 
         output = encodeOutput(token, weight);
 

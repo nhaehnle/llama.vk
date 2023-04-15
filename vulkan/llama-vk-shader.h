@@ -21,6 +21,8 @@ struct GlobalConstantBuffer {
     float topP;
     float temp;
     float rand;
+    uint repeatLastN;
+    float repeatPenalty;
 };
 
 struct ResultBuffer {
